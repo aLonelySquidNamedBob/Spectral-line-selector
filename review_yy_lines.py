@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 import pandas as pd
@@ -11,13 +11,24 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 
+# DEFAULT VALUES
 DEFAULT_VIEW_WIDTH = 3.0
 DEFAULT_PEAK_WINDOW = 0.05
-DEFAULT_PEAK_THRESHOLD = 0.4  # keep lines whose min flux is at or above this value
-DEFAULT_YMIN_OVERRIDE = 0.35
-DEFAULT_YMAX_OVERRIDE = 1.1
+DEFAULT_PEAK_THRESHOLD = 0.4 
+DEFAULT_YMIN = 0.35
+DEFAULT_YMAX = 1.1
 DEFAULT_OUTPUT_NAME = "kept_lines_yy.csv"
+SPECTRUM_COLOR_CYCLE = [
+    "steelblue",
+    "tomato",
+    "seagreen",
+    "darkorchid",
+    "sienna",
+    "royalblue",
+    "goldenrod",
+]
 
+# CLASSES
 
 @dataclass(frozen=True)
 class Spectrum:
@@ -41,6 +52,13 @@ class Spectrum:
         return float(np.min(self.flux[left:right]))
 
 
+@dataclass
+class SpectrumConfigRow:
+    frame: ttk.Frame
+    label_var: tk.StringVar
+    path_var: tk.StringVar
+
+
 class LineReviewerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -49,25 +67,28 @@ class LineReviewerApp:
         self.project_root = Path(__file__).resolve().parent.parent
         self.results_dir = self.project_root / "python stuff" / "results"
         self.output_path = self.results_dir / DEFAULT_OUTPUT_NAME
+        self.default_spectra = [
+            ("Star A", self.project_root / "data" / "Al_Phe_A_sorted.csv"),
+            ("Star B", self.project_root / "data" / "Al_Phe_B_sorted.csv"),
+        ]
 
-        self.yy_lines = pd.read_csv(self.results_dir / "lines_yy.csv")
-        self.non_yy_lines = pd.read_csv(self.results_dir / "lines.csv")
-        self.star_a = self._load_spectrum(self.project_root / "data" / "Al_Phe_A_sorted.csv", "Star A")
-        self.star_b = self._load_spectrum(self.project_root / "data" / "Al_Phe_B_sorted.csv", "Star B")
+        self.spectrum_rows: list[SpectrumConfigRow] = []
+        self.spectra: list[Spectrum] = []
+        self.spectrum_flux_columns: list[str] = []
+        self.yy_lines = pd.DataFrame(columns=["species", "wavelength"])
+        self.non_yy_lines = pd.DataFrame(columns=["species", "wavelength"])
 
-        self.yy_lines = self.yy_lines.sort_values(["species", "wavelength"]).reset_index(drop=True)
-        self.non_yy_lines = self.non_yy_lines.sort_values("wavelength").reset_index(drop=True)
+        self.yy_lines_path_var = tk.StringVar(value=str(self.results_dir / "lines_yy.csv"))
+        self.non_yy_lines_path_var = tk.StringVar(value=str(self.results_dir / "lines.csv"))
 
-        self.species_options = sorted(self.yy_lines["species"].dropna().unique().tolist())
-        if not self.species_options:
-            raise ValueError("No species found in lines_yy.csv")
+        self.species_options: list[str] = []
 
-        self.current_species = tk.StringVar(value=self.species_options[0])
+        self.current_species = tk.StringVar(value="")
         self.peak_threshold_var = tk.StringVar(value=f"{DEFAULT_PEAK_THRESHOLD:.2f}")
         self.peak_window_var = tk.StringVar(value=f"{DEFAULT_PEAK_WINDOW:.2f}")
         self.view_width_var = tk.StringVar(value=f"{DEFAULT_VIEW_WIDTH:.2f}")
-        self.y_min_var = tk.StringVar(value=DEFAULT_YMIN_OVERRIDE)
-        self.y_max_var = tk.StringVar(value=DEFAULT_YMAX_OVERRIDE)
+        self.y_min_var = tk.StringVar(value=str(DEFAULT_YMIN))
+        self.y_max_var = tk.StringVar(value=str(DEFAULT_YMAX))
         self.output_var = tk.StringVar(value=str(self.output_path))
         self.show_other_yy_var = tk.BooleanVar(value=True)
         self.show_non_yy_var = tk.BooleanVar(value=True)
@@ -79,21 +100,151 @@ class LineReviewerApp:
         self.active_y_max: float | None = None
         self.loaded_output_path = Path(self.output_var.get())
 
-        self.filtered_lines = pd.DataFrame(columns=self.yy_lines.columns)
+        self.filtered_lines = pd.DataFrame(columns=["species", "wavelength", "min_flux"])
         self.current_index = 0
-        self.peak_cache: dict[tuple[float, float], tuple[float, float, float]] = {}
+        self.peak_cache: dict[tuple[float, float], dict[str, float]] = {}
         self.kept_lines = self._load_existing_output()
 
         self._build_ui()
+
+        for default_label, default_path in self.default_spectra:
+            self.add_spectrum_row(default_label, str(default_path))
+
         self.apply_filters(reset_index=True)
 
+    def _find_column(self, columns: list[str], candidates: list[str]) -> str | None:
+        lower_to_original = {column.lower(): column for column in columns}
+        for candidate in candidates:
+            match = lower_to_original.get(candidate.lower())
+            if match is not None:
+                return match
+        return None
+
+    def _safe_column_name(self, label: str, used: set[str]) -> str:
+        base = "".join(ch.lower() if ch.isalnum() else "_" for ch in label.strip())
+        base = "_".join(part for part in base.split("_") if part)
+        if not base:
+            base = "spectrum"
+
+        candidate = f"min_flux_{base}"
+        suffix = 2
+        while candidate in used:
+            candidate = f"min_flux_{base}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        return candidate
+
     def _load_spectrum(self, path: Path, label: str) -> Spectrum:
+        if not path.exists():
+            raise ValueError(f"Spectrum file not found: {path}")
+
         frame = pd.read_csv(path)
+        wavelength_col = self._find_column(frame.columns.tolist(), ["Wavelength", "wavelength"])
+        flux_col = self._find_column(frame.columns.tolist(), ["Flux", "flux"])
+
+        if wavelength_col is None or flux_col is None:
+            raise ValueError(
+                f"Spectrum file {path} must contain Wavelength and Flux columns."
+            )
+
+        wavelength = pd.to_numeric(frame[wavelength_col], errors="coerce")
+        flux = pd.to_numeric(frame[flux_col], errors="coerce")
+        valid = ~(wavelength.isna() | flux.isna())
+        wavelength = wavelength[valid].to_numpy(dtype=float)
+        flux = flux[valid].to_numpy(dtype=float)
+
+        if wavelength.size == 0:
+            raise ValueError(f"Spectrum file {path} contains no valid numeric rows.")
+
+        order = np.argsort(wavelength)
+        wavelength = wavelength[order]
+        flux = flux[order]
+
         return Spectrum(
-            wavelength=frame["Wavelength"].to_numpy(dtype=float),
-            flux=frame["Flux"].to_numpy(dtype=float),
+            wavelength=wavelength,
+            flux=flux,
             label=label,
         )
+
+    def _load_line_list(self, path_text: str, name: str, required: bool) -> pd.DataFrame:
+        stripped = path_text.strip()
+        if not stripped:
+            if required:
+                raise ValueError(f"{name} path is empty.")
+            return pd.DataFrame(columns=["species", "wavelength"])
+
+        path = Path(stripped)
+
+        if not path.exists():
+            if required:
+                raise ValueError(f"{name} not found: {path}")
+            return pd.DataFrame(columns=["species", "wavelength"])
+
+        frame = pd.read_csv(path)
+        species_col = self._find_column(frame.columns.tolist(), ["species", "Species"])
+        wavelength_col = self._find_column(frame.columns.tolist(), ["wavelength", "Wavelength"])
+        if species_col is None or wavelength_col is None:
+            raise ValueError(
+                f"{name} must contain species and wavelength columns."
+            )
+
+        loaded = pd.DataFrame(
+            {
+                "species": frame[species_col].astype(str),
+                "wavelength": pd.to_numeric(frame[wavelength_col], errors="coerce"),
+            }
+        )
+        loaded = loaded.replace({"species": {"nan": ""}})
+        loaded = loaded[(loaded["species"].str.strip() != "") & loaded["wavelength"].notna()]
+
+        if required and loaded.empty:
+            raise ValueError(f"{name} has no valid lines after parsing.")
+
+        if loaded.empty:
+            return pd.DataFrame(columns=["species", "wavelength"])
+
+        return loaded.sort_values(["species", "wavelength"]).reset_index(drop=True)
+
+    def _reload_inputs(self) -> None:
+        yy_path_text = self.yy_lines_path_var.get().strip()
+        non_yy_path_text = self.non_yy_lines_path_var.get().strip()
+
+        yy_lines = self._load_line_list(yy_path_text, "YY line list", required=True)
+        non_yy_lines = self._load_line_list(non_yy_path_text, "Non-yy line list", required=False)
+
+        spectra: list[Spectrum] = []
+        spectrum_flux_columns: list[str] = []
+        used_columns: set[str] = set()
+
+        for index, row in enumerate(self.spectrum_rows, start=1):
+            path_text = row.path_var.get().strip()
+            if not path_text:
+                continue
+
+            label = row.label_var.get().strip() or f"Spectrum {index}"
+            spectrum = self._load_spectrum(Path(path_text), label)
+            spectra.append(spectrum)
+            spectrum_flux_columns.append(self._safe_column_name(label, used_columns))
+
+        if not spectra:
+            raise ValueError("At least one valid spectrum must be configured.")
+
+        species_options = sorted(yy_lines["species"].dropna().unique().tolist())
+        if not species_options:
+            raise ValueError("No species found in the YY line list.")
+
+        self.yy_lines = yy_lines
+        self.non_yy_lines = non_yy_lines
+        self.spectra = spectra
+        self.spectrum_flux_columns = spectrum_flux_columns
+        self.species_options = species_options
+        self.peak_cache.clear()
+
+        current = self.current_species.get()
+        if current not in self.species_options:
+            self.current_species.set(self.species_options[0])
+        if hasattr(self, "species_box"):
+            self.species_box.configure(values=self.species_options)
 
     def _load_existing_output(self) -> pd.DataFrame:
         path = Path(self.output_var.get())
@@ -103,24 +254,121 @@ class LineReviewerApp:
                 self.loaded_output_path = path
                 return frame
         self.loaded_output_path = path
-        return pd.DataFrame(
-            columns=["species", "wavelength", "min_flux_a", "min_flux_b", "min_flux", "source"]
+        return pd.DataFrame(columns=["species", "wavelength", "min_flux", "source"])
+
+    def browse_yy_lines(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select YY line list",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if selected:
+            self.yy_lines_path_var.set(selected)
+
+    def browse_non_yy_lines(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select non-yy line list",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if selected:
+            self.non_yy_lines_path_var.set(selected)
+
+    def browse_output(self) -> None:
+        selected = filedialog.asksaveasfilename(
+            title="Select output CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=Path(self.output_var.get()).name,
+        )
+        if selected:
+            self.output_var.set(selected)
+
+    def add_spectrum_row(self, label: str = "", path: str = "") -> None:
+        frame = ttk.Frame(self.spectra_rows_frame)
+        label_var = tk.StringVar(value=label)
+        path_var = tk.StringVar(value=path)
+
+        ttk.Label(frame, text="Label").pack(side=tk.LEFT)
+        ttk.Entry(frame, textvariable=label_var, width=16).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(frame, text="CSV").pack(side=tk.LEFT)
+        ttk.Entry(frame, textvariable=path_var, width=58).pack(side=tk.LEFT, padx=(4, 4), fill=tk.X, expand=True)
+        ttk.Button(frame, text="Browse", command=lambda var=path_var: self._browse_spectrum_path(var)).pack(side=tk.LEFT)
+
+        row = SpectrumConfigRow(frame=frame, label_var=label_var, path_var=path_var)
+        ttk.Button(frame, text="Remove", command=lambda target=row: self.remove_spectrum_row(target)).pack(
+            side=tk.LEFT,
+            padx=(6, 0),
         )
 
+        frame.pack(side=tk.TOP, fill=tk.X, pady=2)
+        self.spectrum_rows.append(row)
+
+    def _browse_spectrum_path(self, target: tk.StringVar) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select spectrum CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if selected:
+            target.set(selected)
+
+    def remove_spectrum_row(self, target: SpectrumConfigRow) -> None:
+        if len(self.spectrum_rows) <= 1:
+            messagebox.showerror("Invalid configuration", "At least one spectrum row is required.")
+            return
+        target.frame.destroy()
+        self.spectrum_rows = [row for row in self.spectrum_rows if row is not target]
+
     def _build_ui(self) -> None:
-        controls = ttk.Frame(self.root, padding=10)
+        config = ttk.LabelFrame(self.root, text="Input configuration", padding=10)
+        config.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 4))
+
+        linelist_frame = ttk.Frame(config)
+        linelist_frame.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(linelist_frame, text="YY line list").grid(row=0, column=0, sticky="w")
+        ttk.Entry(linelist_frame, textvariable=self.yy_lines_path_var, width=86).grid(
+            row=0,
+            column=1,
+            padx=(6, 6),
+            sticky="ew",
+        )
+        ttk.Button(linelist_frame, text="Browse", command=self.browse_yy_lines).grid(row=0, column=2, sticky="w")
+
+        ttk.Label(linelist_frame, text="Non-yy line list").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(linelist_frame, textvariable=self.non_yy_lines_path_var, width=86).grid(
+            row=1,
+            column=1,
+            padx=(6, 6),
+            pady=(6, 0),
+            sticky="ew",
+        )
+        ttk.Button(linelist_frame, text="Browse", command=self.browse_non_yy_lines).grid(
+            row=1,
+            column=2,
+            sticky="w",
+            pady=(6, 0),
+        )
+        linelist_frame.grid_columnconfigure(1, weight=1)
+
+        spectrum_header = ttk.Frame(config)
+        spectrum_header.pack(side=tk.TOP, fill=tk.X, pady=(10, 2))
+        ttk.Label(spectrum_header, text="Spectra to compare").pack(side=tk.LEFT)
+        ttk.Button(spectrum_header, text="Add spectrum", command=self.add_spectrum_row).pack(side=tk.LEFT, padx=(10, 0))
+
+        self.spectra_rows_frame = ttk.Frame(config)
+        self.spectra_rows_frame.pack(side=tk.TOP, fill=tk.X)
+
+        controls = ttk.Frame(self.root, padding=(10, 4, 10, 8))
         controls.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Label(controls, text="YY species").grid(row=0, column=0, sticky="w")
-        species_box = ttk.Combobox(
+        self.species_box = ttk.Combobox(
             controls,
             textvariable=self.current_species,
             values=self.species_options,
             state="readonly",
             width=18,
         )
-        species_box.grid(row=0, column=1, padx=(6, 12), sticky="w")
-        species_box.bind("<<ComboboxSelected>>", lambda _event: self.apply_filters(reset_index=True))
+        self.species_box.grid(row=0, column=1, padx=(6, 12), sticky="w")
+        self.species_box.bind("<<ComboboxSelected>>", lambda _event: self.apply_filters(reset_index=True))
 
         ttk.Label(controls, text="Max min flux (dip)").grid(row=0, column=2, sticky="w")
         ttk.Entry(controls, textvariable=self.peak_threshold_var, width=8).grid(row=0, column=3, padx=(6, 12))
@@ -158,6 +406,7 @@ class LineReviewerApp:
 
         ttk.Label(overlay_frame, text="Output CSV").pack(side=tk.LEFT, padx=(18, 6))
         ttk.Entry(overlay_frame, textvariable=self.output_var, width=55).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(overlay_frame, text="Browse", command=self.browse_output).pack(side=tk.LEFT, padx=(6, 0))
 
         nav = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         nav.pack(side=tk.TOP, fill=tk.X)
@@ -192,13 +441,21 @@ class LineReviewerApp:
             return None
         return self.parse_float(stripped, field_name)
 
-    def min_flux_values(self, wavelength: float, half_window: float) -> tuple[float, float, float]:
+    def min_flux_values(self, wavelength: float, half_window: float) -> dict[str, float]:
         key = (round(float(wavelength), 6), round(float(half_window), 6))
         if key not in self.peak_cache:
-            min_a = self.star_a.min_flux(wavelength, half_window)
-            min_b = self.star_b.min_flux(wavelength, half_window)
-            combined = float(np.nanmin([min_a, min_b])) if not (np.isnan(min_a) and np.isnan(min_b)) else float("nan")
-            self.peak_cache[key] = (min_a, min_b, combined)
+            minima: dict[str, float] = {}
+            values: list[float] = []
+            for spectrum, column_name in zip(self.spectra, self.spectrum_flux_columns):
+                value = spectrum.min_flux(wavelength, half_window)
+                minima[column_name] = value
+                values.append(value)
+
+            if values and not np.all(np.isnan(values)):
+                minima["min_flux"] = float(np.nanmin(values))
+            else:
+                minima["min_flux"] = float("nan")
+            self.peak_cache[key] = minima
         return self.peak_cache[key]
 
     def apply_filters(self, reset_index: bool = False) -> None:
@@ -223,6 +480,14 @@ class LineReviewerApp:
         self.active_view_width = view_width
         self.active_y_min = y_min
         self.active_y_max = y_max
+
+        try:
+            self._reload_inputs()
+        except ValueError as exc:
+            messagebox.showerror("Invalid input configuration", str(exc))
+            self.status_var.set("Fix input paths/labels and apply again.")
+            return
+
         self.ensure_output_loaded()
 
         species = self.current_species.get()
@@ -234,7 +499,8 @@ class LineReviewerApp:
             return
 
         peaks = species_lines["wavelength"].apply(lambda wl: self.min_flux_values(wl, self.active_peak_window))
-        species_lines[["min_flux_a", "min_flux_b", "min_flux"]] = pd.DataFrame(
+        peak_columns = self.spectrum_flux_columns + ["min_flux"]
+        species_lines[peak_columns] = pd.DataFrame(
             peaks.tolist(), index=species_lines.index
         )
         species_lines = species_lines[species_lines["min_flux"] >= self.active_peak_threshold].reset_index(drop=True)
@@ -295,13 +561,15 @@ class LineReviewerApp:
                 {
                     "species": row["species"],
                     "wavelength": row["wavelength"],
-                    "min_flux_a": row["min_flux_a"],
-                    "min_flux_b": row["min_flux_b"],
                     "min_flux": row["min_flux"],
-                    "source": "lines_yy.csv",
+                    "source": Path(self.yy_lines_path_var.get()).name,
                 }
             ]
         )
+
+        for column_name in self.spectrum_flux_columns:
+            if column_name in row.index:
+                record[column_name] = row[column_name]
 
         if self.kept_lines.empty:
             self.kept_lines = record
@@ -358,11 +626,13 @@ class LineReviewerApp:
         view_width = self.active_view_width
         peak_window = self.active_peak_window
 
-        wave_a, flux_a = self.star_a.region(wavelength, view_width)
-        wave_b, flux_b = self.star_b.region(wavelength, view_width)
-
-        self.ax.plot(wave_a, flux_a, color="steelblue", linewidth=1.0, label=self.star_a.label)
-        self.ax.plot(wave_b, flux_b, color="tomato", linewidth=1.0, label=self.star_b.label)
+        flux_segments: list[np.ndarray] = []
+        for index, spectrum in enumerate(self.spectra):
+            wave, flux = spectrum.region(wavelength, view_width)
+            color = SPECTRUM_COLOR_CYCLE[index % len(SPECTRUM_COLOR_CYCLE)]
+            self.ax.plot(wave, flux, color=color, linewidth=1.0, label=spectrum.label)
+            if flux.size:
+                flux_segments.append(flux)
         self.ax.axvline(wavelength, color="forestgreen", linewidth=1.8, label=f"Current yy line: {row['species']}")
 
         if self.show_other_yy_var.get():
@@ -385,7 +655,7 @@ class LineReviewerApp:
             ]
             self._draw_reference_lines(non_yy_visible, "dimgray", ":", 0.68, "Non-yy")
 
-        combined_flux = np.concatenate([flux_a, flux_b]) if len(flux_a) or len(flux_b) else np.array([0.0, 1.0])
+        combined_flux = np.concatenate(flux_segments) if flux_segments else np.array([0.0, 1.0])
         lower = float(np.nanmin(combined_flux))
         upper = float(np.nanmax(combined_flux))
         padding = max((upper - lower) * 0.12, 0.03)
@@ -403,8 +673,13 @@ class LineReviewerApp:
         self.ax.grid(alpha=0.18)
 
         kept_marker = "kept" if self.is_kept(row["species"], wavelength) else "not kept"
+        minima_text_parts: list[str] = []
+        for spectrum, column_name in zip(self.spectra, self.spectrum_flux_columns):
+            if column_name in row.index:
+                minima_text_parts.append(f"{spectrum.label}={row[column_name]:.3f}")
+        minima_text = "  ".join(minima_text_parts)
         self.status_var.set(
-            f"{self.current_index + 1}/{len(self.filtered_lines)}  |  min A={row['min_flux_a']:.3f}  min B={row['min_flux_b']:.3f}  dip={row['min_flux']:.3f}  |  {kept_marker}  |  saved={len(self.kept_lines)}"
+            f"{self.current_index + 1}/{len(self.filtered_lines)}  |  {minima_text}  dip={row['min_flux']:.3f}  |  {kept_marker}  |  saved={len(self.kept_lines)}"
         )
 
         self.ax.axvspan(wavelength - peak_window, wavelength + peak_window, color="forestgreen", alpha=0.06)
