@@ -31,6 +31,7 @@ DEFAULT_VOIGT_SIGMA = 0.05
 DEFAULT_VOIGT_GAMMA = 0.05
 DEFAULT_VOIGT_SHIFT = 0.0
 DEFAULT_VOIGT_FIT_WIDTH = 0.2
+ANGSTROM_TO_MILLIANGSTROM = 1000.0
 SPECTRUM_COLOR_CYCLE = [
     "steelblue",
     "tomato",
@@ -109,9 +110,9 @@ class LineReviewerApp:
         self.output_var = tk.StringVar(value=str(configuration.get("output", "")))
         self.show_other_yy_var = tk.BooleanVar(value=bool(configuration.get("show_other_yy", True)))
         self.show_non_yy_var = tk.BooleanVar(value=bool(configuration.get("show_non_yy", True)))
-        self.measurement_mode_var = tk.StringVar(value=str(configuration.get("measurement_mode", "EW")))
+        self.measurement_mode_var = tk.StringVar(value=str(configuration.get("measurement_mode", "Fit Voigt")))
         if self.measurement_mode_var.get() not in {"EW", "Manual Voigt", "Fit Voigt"}:
-            self.measurement_mode_var.set("EW")
+            self.measurement_mode_var.set("Fit Voigt")
         self.voigt_depth_var = tk.DoubleVar(value=self._configuration_float(configuration, "voigt_depth", DEFAULT_VOIGT_DEPTH))
         self.voigt_sigma_var = tk.DoubleVar(value=self._configuration_float(configuration, "voigt_sigma", DEFAULT_VOIGT_SIGMA))
         self.voigt_gamma_var = tk.DoubleVar(value=self._configuration_float(configuration, "voigt_gamma", DEFAULT_VOIGT_GAMMA))
@@ -135,6 +136,7 @@ class LineReviewerApp:
         self.peak_cache: dict[tuple[float, float], dict[str, float]] = {}
         self.kept_lines = self._load_existing_output()
         self.saved_integration_bounds: dict[tuple[str, float], dict[str, tuple[float, float]]] = {}
+        self.saved_fit_bounds: dict[tuple[str, float], tuple[float, float]] = {}
         self.fit_bounds: dict[tuple[str, float], tuple[float, float]] = {}
         self.config_visible = False
         self.integration_bounds: dict[str, tuple[float, float]] = {}
@@ -252,9 +254,9 @@ class LineReviewerApp:
             variable.set(str(configuration.get(key, default)))
         self.show_other_yy_var.set(bool(configuration.get("show_other_yy", True)))
         self.show_non_yy_var.set(bool(configuration.get("show_non_yy", True)))
-        self.measurement_mode_var.set(str(configuration.get("measurement_mode", "EW")))
+        self.measurement_mode_var.set(str(configuration.get("measurement_mode", "Fit Voigt")))
         if self.measurement_mode_var.get() not in {"EW", "Manual Voigt", "Fit Voigt"}:
-            self.measurement_mode_var.set("EW")
+            self.measurement_mode_var.set("Fit Voigt")
         self.voigt_depth_var.set(self._configuration_float(configuration, "voigt_depth", DEFAULT_VOIGT_DEPTH))
         self.voigt_sigma_var.set(self._configuration_float(configuration, "voigt_sigma", DEFAULT_VOIGT_SIGMA))
         self.voigt_gamma_var.set(self._configuration_float(configuration, "voigt_gamma", DEFAULT_VOIGT_GAMMA))
@@ -403,6 +405,7 @@ class LineReviewerApp:
         self.peak_cache.clear()
         self._refresh_saved_integration_bounds()
         self.integration_bounds.clear()
+        self.fit_bounds.clear()
 
         current = self.current_species.get()
         if current not in self.species_options:
@@ -422,9 +425,11 @@ class LineReviewerApp:
 
     def _refresh_saved_integration_bounds(self) -> None:
         saved_bounds: dict[tuple[str, float], dict[str, tuple[float, float]]] = {}
+        saved_fit_bounds: dict[tuple[str, float], tuple[float, float]] = {}
 
-        if self.kept_lines.empty or not self.spectrum_flux_columns:
+        if self.kept_lines.empty:
             self.saved_integration_bounds = saved_bounds
+            self.saved_fit_bounds = saved_fit_bounds
             return
 
         for _, row in self.kept_lines.iterrows():
@@ -434,12 +439,20 @@ class LineReviewerApp:
                 continue
 
             line_key = (species, round(float(wavelength), 6))
+            fit_left = row.get("fit_left")
+            fit_right = row.get("fit_right")
+            if not pd.isna(fit_left) and not pd.isna(fit_right):
+                saved_fit_bounds[line_key] = (float(fit_left), float(fit_right))
+
             bounds_for_line: dict[str, tuple[float, float]] = {}
 
-            for column_name in self.spectrum_flux_columns:
-                suffix = self._ew_name_suffix(column_name)
-                left_key = f"ew_left_{suffix}"
-                right_key = f"ew_right_{suffix}"
+            for index, column_name in enumerate(self.spectrum_flux_columns):
+                left_key = self._measurement_column("ew_left", index)
+                right_key = self._measurement_column("ew_right", index)
+                if len(self.spectra) == 1 and left_key not in row and right_key not in row:
+                    legacy_suffix = self._ew_name_suffix(column_name)
+                    left_key = f"ew_left_{legacy_suffix}"
+                    right_key = f"ew_right_{legacy_suffix}"
                 if left_key not in row or right_key not in row:
                     continue
 
@@ -454,6 +467,7 @@ class LineReviewerApp:
                 saved_bounds[line_key] = bounds_for_line
 
         self.saved_integration_bounds = saved_bounds
+        self.saved_fit_bounds = saved_fit_bounds
 
     def browse_yy_lines(self) -> None:
         selected = filedialog.askopenfilename(
@@ -657,7 +671,8 @@ class LineReviewerApp:
         self._add_voigt_scale(self.manual_voigt_controls, "Sigma (A)", self.voigt_sigma_var, 0.001, 0.3, self.voigt_sigma_label_var)
         self._add_voigt_scale(self.manual_voigt_controls, "Gamma (A)", self.voigt_gamma_var, 0.001, 0.3, self.voigt_gamma_label_var)
         self._add_voigt_scale(self.manual_voigt_controls, "Shift (A)", self.voigt_shift_var, -0.1, 0.1, self.voigt_shift_label_var)
-        ttk.Button(voigt_frame, text="Fit Voigt", command=self.fit_voigt).pack(side=tk.LEFT, padx=(10, 0))
+        self.fit_voigt_button = ttk.Button(voigt_frame, text="Fit Voigt", command=self.fit_voigt)
+        self.fit_voigt_button.pack(side=tk.LEFT, padx=(10, 0))
         self._update_voigt_labels()
 
         ttk.Label(overlay_frame, text="Output CSV").pack(side=tk.LEFT, padx=(18, 6))
@@ -734,7 +749,12 @@ class LineReviewerApp:
     def measurement_mode_changed(self) -> None:
         self.dragging_handle = None
         self._update_mode_controls()
+        self._fit_current_line_if_needed()
         self.refresh_plot()
+
+    def _fit_current_line_if_needed(self) -> None:
+        if self.measurement_mode_var.get() == "Fit Voigt" and not self.filtered_lines.empty:
+            self.fit_voigt(show_warning=False)
 
     def _update_mode_controls(self) -> None:
         if self.measurement_mode_var.get() == "Manual Voigt":
@@ -746,6 +766,11 @@ class LineReviewerApp:
             self.reset_bounds_button.configure(state=tk.DISABLED)
         else:
             self.reset_bounds_button.configure(state=tk.NORMAL)
+        if self.measurement_mode_var.get() == "Fit Voigt":
+            if not self.fit_voigt_button.winfo_manager():
+                self.fit_voigt_button.pack(side=tk.LEFT, padx=(10, 0))
+        elif self.fit_voigt_button.winfo_manager():
+            self.fit_voigt_button.pack_forget()
 
     def parse_optional_float(self, value: str, field_name: str) -> float | None:
         stripped = value.strip()
@@ -783,7 +808,7 @@ class LineReviewerApp:
         profile = voigt_profile(wavelength - center - shift, sigma, gamma) / peak
         return 1.0 - depth * profile
 
-    def fit_voigt(self) -> None:
+    def fit_voigt(self, show_warning: bool = True) -> None:
         row = self.current_line_row()
         if row is None or pd.isna(row["wavelength"]):
             return
@@ -849,7 +874,7 @@ class LineReviewerApp:
         self.fitted_voigt_line_key = line_key
         self.measurement_mode_var.set("Fit Voigt")
         self.refresh_plot()
-        if failures:
+        if failures and show_warning:
             messagebox.showwarning("Voigt fit incomplete", f"No fit was found for: {', '.join(failures)}")
 
     def min_flux_values(self, wavelength: float, half_window: float) -> dict[str, float]:
@@ -931,6 +956,7 @@ class LineReviewerApp:
                 self.current_index = int(matching_rows.index[0])
         elif self.current_index >= len(self.filtered_lines):
             self.current_index = max(len(self.filtered_lines) - 1, 0)
+        self._fit_current_line_if_needed()
         self.refresh_plot()
 
     def current_line_row(self) -> pd.Series | None:
@@ -942,12 +968,14 @@ class LineReviewerApp:
         if self.filtered_lines.empty:
             return
         self.current_index = max(self.current_index - 1, 0)
+        self._fit_current_line_if_needed()
         self.refresh_plot()
 
     def next_line(self) -> None:
         if self.filtered_lines.empty:
             return
         self.current_index = min(self.current_index + 1, len(self.filtered_lines) - 1)
+        self._fit_current_line_if_needed()
         self.refresh_plot()
 
     def is_kept(self, species: str, wavelength: float) -> bool:
@@ -979,13 +1007,14 @@ class LineReviewerApp:
                     "wavelength": row["wavelength"],
                     "min_flux": row["min_flux"],
                     "source": Path(self.yy_lines_path_var.get()).name,
+                    "measurement_mode": self.measurement_mode_var.get(),
                 }
             ]
         )
 
-        for column_name in self.spectrum_flux_columns:
+        for index, column_name in enumerate(self.spectrum_flux_columns):
             if column_name in row.index:
-                record[column_name] = row[column_name]
+                record[self._measurement_column("min_flux", index)] = row[column_name]
 
         mode = self.measurement_mode_var.get()
         ew_values = self.current_ew_values() if mode == "EW" else {}
@@ -997,23 +1026,27 @@ class LineReviewerApp:
                 fitted = self.fitted_voigt_parameters.get(spectrum.label)
                 if fitted is None:
                     continue
-                suffix = self._ew_name_suffix(self.spectrum_flux_columns[index])
-                record[f"voigt_fit_depth_{suffix}"] = fitted[0]
-                record[f"voigt_fit_sigma_{suffix}"] = fitted[1]
-                record[f"voigt_fit_gamma_{suffix}"] = fitted[2]
-                record[f"voigt_fit_shift_{suffix}"] = fitted[3]
-                record[f"voigt_fit_area_{suffix}"] = self.fitted_voigt_areas[spectrum.label]
+                record[self._measurement_column("voigt_fit_depth", index)] = fitted[0]
+                record[self._measurement_column("voigt_fit_sigma", index)] = fitted[1]
+                record[self._measurement_column("voigt_fit_gamma", index)] = fitted[2]
+                record[self._measurement_column("voigt_fit_shift", index)] = fitted[3]
+                record[self._measurement_column("voigt_fit_area", index)] = (
+                    self.fitted_voigt_areas[spectrum.label] * ANGSTROM_TO_MILLIANGSTROM
+                )
 
         center = float(row["wavelength"])
         if mode == "EW":
-            for column_name in self.spectrum_flux_columns:
-                suffix = self._ew_name_suffix(column_name)
+            for index, column_name in enumerate(self.spectrum_flux_columns):
                 left, right = self._get_ew_bounds(column_name, center)
-                record[f"ew_left_{suffix}"] = left
-                record[f"ew_right_{suffix}"] = right
+                record[self._measurement_column("ew_left", index)] = left
+                record[self._measurement_column("ew_right", index)] = right
+        elif mode == "Fit Voigt":
+            fit_left, fit_right = self._get_fit_bounds(str(row["species"]), center)
+            record["fit_left"] = fit_left
+            record["fit_right"] = fit_right
         elif mode == "Manual Voigt":
             _, manual_area = self.voigt_values(center, np.array([center]))
-            record["voigt_manual_area"] = manual_area
+            record["voigt_manual_area"] = manual_area * ANGSTROM_TO_MILLIANGSTROM
             record["voigt_manual_shift"] = float(self.voigt_shift_var.get())
 
         if self.kept_lines.empty:
@@ -1067,6 +1100,15 @@ class LineReviewerApp:
     def _ew_name_suffix(self, column_name: str) -> str:
         return column_name.replace("min_flux_", "", 1)
 
+    def _measurement_suffix(self, index: int) -> str:
+        if len(self.spectra) == 1:
+            return ""
+        return self._ew_name_suffix(self.spectrum_flux_columns[index])
+
+    def _measurement_column(self, base_name: str, index: int) -> str:
+        suffix = self._measurement_suffix(index)
+        return base_name if not suffix else f"{base_name}_{suffix}"
+
     def reset_active_bounds(self) -> None:
         row = self.current_line_row()
         if row is None:
@@ -1095,12 +1137,16 @@ class LineReviewerApp:
                 self.integration_bounds[column_name] = self._clamp_bounds(bounds[0], bounds[1], center)
 
     def _initialize_fit_bounds(self, species: str, center: float) -> None:
+        line_key = (species, round(center, 6))
+        saved_bounds = self.saved_fit_bounds.get(line_key)
+        if saved_bounds is not None:
+            self.fit_bounds[line_key] = self._clamp_bounds(
+                saved_bounds[0], saved_bounds[1], center
+            )
+            return
+
         width = min(float(self.voigt_fit_width_var.get()), self.active_view_width)
-        self.fit_bounds[(species, round(center, 6))] = self._clamp_bounds(
-            center - width,
-            center + width,
-            center,
-        )
+        self.fit_bounds[line_key] = self._clamp_bounds(center - width, center + width, center)
 
     def _get_fit_bounds(self, species: str, center: float) -> tuple[float, float]:
         key = (species, round(center, 6))
@@ -1166,17 +1212,19 @@ class LineReviewerApp:
         ew_values: dict[str, float] = {}
         ew_scalar: list[float] = []
 
-        for spectrum, column_name in zip(self.spectra, self.spectrum_flux_columns):
+        for index, (spectrum, column_name) in enumerate(zip(self.spectra, self.spectrum_flux_columns)):
             left, right = self._get_ew_bounds(column_name, center)
             ew = self._integrate_equivalent_width(spectrum, left, right)
-            suffix = self._ew_name_suffix(column_name)
-
-            ew_values[f"ew_{suffix}"] = ew
+            ew_values[self._measurement_column("ew", index)] = ew * ANGSTROM_TO_MILLIANGSTROM
 
             if not np.isnan(ew):
                 ew_scalar.append(ew)
 
-        ew_values["ew_mean"] = float(np.mean(ew_scalar)) if ew_scalar else float("nan")
+        ew_values["ew_mean"] = (
+            float(np.mean(ew_scalar)) * ANGSTROM_TO_MILLIANGSTROM
+            if ew_scalar
+            else float("nan")
+        )
         return ew_values
 
     def on_mouse_press(self, event: Any) -> None:
@@ -1373,16 +1421,17 @@ class LineReviewerApp:
         ew_values = self.current_ew_values() if mode == "EW" else {}
         self.last_ew_values = ew_values
         ew_text_parts: list[str] = []
-        for spectrum, column_name in zip(self.spectra, self.spectrum_flux_columns):
-            suffix = self._ew_name_suffix(column_name)
-            ew_value = ew_values.get(f"ew_{suffix}", float("nan"))
-            ew_text_parts.append(f"{spectrum.label}={ew_value:.5f}A")
+        for index, (spectrum, column_name) in enumerate(zip(self.spectra, self.spectrum_flux_columns)):
+            ew_value = ew_values.get(self._measurement_column("ew", index), float("nan"))
+            ew_text_parts.append(f"{spectrum.label}={ew_value:.3f}mA")
         ew_text = "  ".join(ew_text_parts)
         ew_mean = ew_values.get("ew_mean", float("nan"))
-        voigt_text = f"  Voigt area={self.last_voigt_area:.5f}A" if mode == "Manual Voigt" else ""
+        voigt_area_milliangstrom = self.last_voigt_area * ANGSTROM_TO_MILLIANGSTROM
+        voigt_text = f"  Voigt area={voigt_area_milliangstrom:.3f}mA" if mode == "Manual Voigt" else ""
         fitted_text = (
             "  Fit area=" + ", ".join(
-                f"{label}={area:.5f}A" for label, area in self.fitted_voigt_areas.items()
+                f"{label}={area * ANGSTROM_TO_MILLIANGSTROM:.3f}mA"
+                for label, area in self.fitted_voigt_areas.items()
             )
             if mode == "Fit Voigt"
             else ""
@@ -1390,7 +1439,7 @@ class LineReviewerApp:
 
         measurement_text = ""
         if mode == "EW":
-            measurement_text = f"EW: {ew_text}  mean={ew_mean:.5f}A"
+            measurement_text = f"EW: {ew_text}  mean={ew_mean:.3f}mA"
         elif mode == "Manual Voigt":
             measurement_text = voigt_text.strip()
         else:
