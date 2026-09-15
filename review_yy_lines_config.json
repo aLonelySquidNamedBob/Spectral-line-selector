@@ -1,0 +1,22 @@
+{
+  "yy_lines": "C:/Users/nicop/EPFL/Uni/BA6/Project/6_Spectral line selector/lines_complete_4000_YY.csv",
+  "non_yy_lines": "C:/Users/nicop/EPFL/Uni/BA6/Project/6_python stuff/results/lines_complete_4000.csv",
+  "output": "C:/Users/nicop/Internship/Spectra/kept_fe_lines.csv",
+  "peak_threshold": "0.0",
+  "peak_window": "0.05",
+  "view_width": "1.0",
+  "y_min": "-0.05",
+  "y_max": "1.1",
+  "show_other_yy": true,
+  "show_non_yy": true,
+  "spectra": [
+    {
+      "label": "HD115444",
+      "path": "C:/Users/nicop/Internship/Spectra/HD_115444_normalised - Copy.csv"
+    }
+  ],
+  "show_voigt": true,
+  "voigt_depth": "0.45",
+  "voigt_sigma": "0.03",
+  "voigt_gamma": "0.05"
+}
