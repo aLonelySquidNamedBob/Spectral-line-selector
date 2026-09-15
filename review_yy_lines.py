@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
@@ -41,6 +42,12 @@ SPECTRUM_COLOR_CYCLE = [
     "royalblue",
     "goldenrod",
 ]
+GES_ION_SLICE = slice(0, 4)
+GES_WAVELENGTH_SLICE = slice(9, 18)
+GES_GFFLAG_INDEX = 83
+GES_SYNFLAG_INDEX = 85
+GES_LOW_ENERGY_SLICE = slice(185, 191)
+GES_UPPER_ENERGY_SLICE = slice(299, 350)
 
 # CLASSES
 
@@ -344,6 +351,12 @@ class LineReviewerApp:
                 raise ValueError(f"{name} not found: {path}")
             return pd.DataFrame(columns=["species", "wavelength"])
 
+        if path.suffix.lower() == ".dat":
+            loaded = self._load_ges_line_list(path, name.lower().startswith("yy"))
+            if required and loaded.empty:
+                raise ValueError(f"{name} has no valid matching lines after parsing.")
+            return loaded
+
         frame = pd.read_csv(path)
         species_col = self._find_column(frame.columns.tolist(), ["species", "Species"])
         wavelength_col = self._find_column(frame.columns.tolist(), ["wavelength", "Wavelength"])
@@ -352,12 +365,22 @@ class LineReviewerApp:
                 f"{name} must contain species and wavelength columns."
             )
 
-        loaded = pd.DataFrame(
-            {
-                "species": frame[species_col].astype(str),
-                "wavelength": pd.to_numeric(frame[wavelength_col], errors="coerce"),
-            }
-        )
+        loaded_values: dict[str, Any] = {
+            "species": frame[species_col].astype(str),
+            "wavelength": pd.to_numeric(frame[wavelength_col], errors="coerce"),
+        }
+        for output_name, candidates in {
+            "ionisation_energy": ["ionisation_energy", "ionization_energy"],
+            "lower_energy": ["lower_energy", "low_energy"],
+            "upper_energy": ["upper_energy"],
+            "gfflag": ["gfflag", "gf_flag"],
+            "synflag": ["synflag", "syn_flag"],
+        }.items():
+            source_column = self._find_column(frame.columns.tolist(), candidates)
+            if source_column is not None:
+                loaded_values[output_name] = frame[source_column]
+
+        loaded = pd.DataFrame(loaded_values)
         loaded = loaded.replace({"species": {"nan": ""}})
         loaded = loaded[(loaded["species"].str.strip() != "") & loaded["wavelength"].notna()]
 
@@ -368,6 +391,67 @@ class LineReviewerApp:
             return pd.DataFrame(columns=["species", "wavelength"])
 
         return loaded.sort_values(["species", "wavelength"]).reset_index(drop=True)
+
+    def _parse_ges_energy(self, field: str) -> float:
+        match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?", field)
+        if match is None:
+            return float("nan")
+        return float(match.group(0).replace("D", "E").replace("d", "e"))
+
+    def _load_ges_line_list(self, path: Path, yy_selection: bool) -> pd.DataFrame:
+        rows: list[dict[str, Any]] = []
+        try:
+            lines = path.read_text(encoding="latin-1").splitlines()
+        except OSError as exc:
+            raise ValueError(f"Could not read GES line list {path}: {exc}") from exc
+
+        for line_number, line in enumerate(lines, start=1):
+            if len(line) < GES_UPPER_ENERGY_SLICE.start:
+                continue
+
+            gfflag = line[GES_GFFLAG_INDEX].strip()
+            synflag = line[GES_SYNFLAG_INDEX].strip()
+            if yy_selection and not (gfflag == "Y" and synflag in {"Y", "U"}):
+                continue
+
+            species = line[GES_ION_SLICE].strip()
+            wavelength_text = line[GES_WAVELENGTH_SLICE].strip()
+            try:
+                wavelength = float(wavelength_text)
+            except ValueError:
+                continue
+            if not species:
+                continue
+
+            lower_energy = self._parse_ges_energy(line[GES_LOW_ENERGY_SLICE])
+            upper_energy = self._parse_ges_energy(line[GES_UPPER_ENERGY_SLICE])
+            rows.append(
+                {
+                    "species": species,
+                    "wavelength": wavelength,
+                    "gfflag": gfflag,
+                    "synflag": synflag,
+                    "lower_energy": lower_energy,
+                    "upper_energy": upper_energy,
+                    "ionisation_energy": upper_energy,
+                    "ges_line_number": line_number,
+                }
+            )
+
+        return pd.DataFrame(rows).sort_values(
+            ["species", "wavelength"]
+        ).reset_index(drop=True) if rows else pd.DataFrame(
+            columns=[
+                "species",
+                "wavelength",
+                "gfflag",
+                "synflag",
+                "lower_energy",
+                "upper_energy",
+                "ionisation_energy",
+                "ges_line_number",
+            ]
+        )
 
     def _reload_inputs(self) -> None:
         yy_path_text = self.yy_lines_path_var.get().strip()
@@ -1015,6 +1099,9 @@ class LineReviewerApp:
         for index, column_name in enumerate(self.spectrum_flux_columns):
             if column_name in row.index:
                 record[self._measurement_column("min_flux", index)] = row[column_name]
+
+        if "ionisation_energy" in row.index:
+            record["ionisation_energy"] = row["ionisation_energy"]
 
         mode = self.measurement_mode_var.get()
         ew_values = self.current_ew_values() if mode == "EW" else {}
