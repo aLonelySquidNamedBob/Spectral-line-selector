@@ -4,20 +4,24 @@ from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from typing import Any
 
 import numpy as np
 import pandas as pd
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends._backend_tk import NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
 
 # DEFAULT VALUES
-DEFAULT_VIEW_WIDTH = 3.0
+DEFAULT_VIEW_WIDTH = 1.0
 DEFAULT_PEAK_WINDOW = 0.05
-DEFAULT_PEAK_THRESHOLD = 0.4 
-DEFAULT_YMIN = 0.35
+# DEFAULT_PEAK_THRESHOLD = 0.4 
+# DEFAULT_YMIN = 0.35
+DEFAULT_PEAK_THRESHOLD = 0.0
+DEFAULT_YMIN = -0.05
 DEFAULT_YMAX = 1.1
-DEFAULT_OUTPUT_NAME = "kept_lines_yy.csv"
+DEFAULT_OUTPUT_NAME = "kept_lines_new_yy.csv"
 SPECTRUM_COLOR_CYCLE = [
     "steelblue",
     "tomato",
@@ -65,11 +69,11 @@ class LineReviewerApp:
         self.root.title("YY Line Reviewer")
 
         self.project_root = Path(__file__).resolve().parent.parent
-        self.results_dir = self.project_root / "python stuff" / "results"
+        self.results_dir = self.project_root / "6_python stuff" / "results"
         self.output_path = self.results_dir / DEFAULT_OUTPUT_NAME
         self.default_spectra = [
-            ("Star A", self.project_root / "data" / "Al_Phe_A_sorted.csv"),
-            ("Star B", self.project_root / "data" / "Al_Phe_B_sorted.csv"),
+            ("Star A", self.project_root / "1_data" / "Al_Phe_A_sorted.csv"),
+            ("Star B", self.project_root / "1_data" / "Al_Phe_B_sorted.csv"),
         ]
 
         self.spectrum_rows: list[SpectrumConfigRow] = []
@@ -78,8 +82,8 @@ class LineReviewerApp:
         self.yy_lines = pd.DataFrame(columns=["species", "wavelength"])
         self.non_yy_lines = pd.DataFrame(columns=["species", "wavelength"])
 
-        self.yy_lines_path_var = tk.StringVar(value=str(self.results_dir / "lines_yy.csv"))
-        self.non_yy_lines_path_var = tk.StringVar(value=str(self.results_dir / "lines.csv"))
+        self.yy_lines_path_var = tk.StringVar(value=str(self.results_dir / "lines_complete_yy.csv"))
+        self.non_yy_lines_path_var = tk.StringVar(value=str(self.results_dir / "lines_complete.csv"))
 
         self.species_options: list[str] = []
 
@@ -104,11 +108,19 @@ class LineReviewerApp:
         self.current_index = 0
         self.peak_cache: dict[tuple[float, float], dict[str, float]] = {}
         self.kept_lines = self._load_existing_output()
+        self.saved_integration_bounds: dict[tuple[str, float], dict[str, tuple[float, float]]] = {}
+        self.config_visible = False
+        self.integration_bounds: dict[str, tuple[float, float]] = {}
+        self.dragging_handle: tuple[str, str] | None = None
+        self.last_line_key: tuple[str, float] | None = None
+        self.last_ew_values: dict[str, float] = {}
 
         self._build_ui()
 
         for default_label, default_path in self.default_spectra:
             self.add_spectrum_row(default_label, str(default_path))
+
+        self.set_config_visibility(False)
 
         self.apply_filters(reset_index=True)
 
@@ -239,6 +251,8 @@ class LineReviewerApp:
         self.spectrum_flux_columns = spectrum_flux_columns
         self.species_options = species_options
         self.peak_cache.clear()
+        self._refresh_saved_integration_bounds()
+        self.integration_bounds.clear()
 
         current = self.current_species.get()
         if current not in self.species_options:
@@ -249,12 +263,47 @@ class LineReviewerApp:
     def _load_existing_output(self) -> pd.DataFrame:
         path = Path(self.output_var.get())
         if path.exists() and path.stat().st_size > 0:
-            frame = pd.read_csv(path)
+            frame = pd.read_csv(path, on_bad_lines='warn')
             if "species" in frame.columns and "wavelength" in frame.columns:
                 self.loaded_output_path = path
                 return frame
         self.loaded_output_path = path
         return pd.DataFrame(columns=["species", "wavelength", "min_flux", "source"])
+
+    def _refresh_saved_integration_bounds(self) -> None:
+        saved_bounds: dict[tuple[str, float], dict[str, tuple[float, float]]] = {}
+
+        if self.kept_lines.empty or not self.spectrum_flux_columns:
+            self.saved_integration_bounds = saved_bounds
+            return
+
+        for _, row in self.kept_lines.iterrows():
+            species = str(row.get("species", "")).strip()
+            wavelength = row.get("wavelength")
+            if not species or pd.isna(wavelength):
+                continue
+
+            line_key = (species, round(float(wavelength), 6))
+            bounds_for_line: dict[str, tuple[float, float]] = {}
+
+            for column_name in self.spectrum_flux_columns:
+                suffix = self._ew_name_suffix(column_name)
+                left_key = f"ew_left_{suffix}"
+                right_key = f"ew_right_{suffix}"
+                if left_key not in row or right_key not in row:
+                    continue
+
+                left_value = row[left_key]
+                right_value = row[right_key]
+                if pd.isna(left_value) or pd.isna(right_value):
+                    continue
+
+                bounds_for_line[column_name] = (float(left_value), float(right_value))
+
+            if bounds_for_line:
+                saved_bounds[line_key] = bounds_for_line
+
+        self.saved_integration_bounds = saved_bounds
 
     def browse_yy_lines(self) -> None:
         selected = filedialog.askopenfilename(
@@ -317,11 +366,36 @@ class LineReviewerApp:
         target.frame.destroy()
         self.spectrum_rows = [row for row in self.spectrum_rows if row is not target]
 
-    def _build_ui(self) -> None:
-        config = ttk.LabelFrame(self.root, text="Input configuration", padding=10)
-        config.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 4))
+    def set_config_visibility(self, visible: bool) -> None:
+        self.config_visible = visible
+        if visible:
+            if not self.config_container.winfo_manager():
+                self.config_container.pack(side=tk.TOP, fill=tk.X, before=self.controls_frame)
+            self.config_toggle_button.configure(text="Hide input configuration")
+        else:
+            if self.config_container.winfo_manager():
+                self.config_container.pack_forget()
+            self.config_toggle_button.configure(text="Show input configuration")
 
-        linelist_frame = ttk.Frame(config)
+    def toggle_config_section(self) -> None:
+        self.set_config_visibility(not self.config_visible)
+
+    def _build_ui(self) -> None:
+        config_shell = ttk.Frame(self.root, padding=(10, 10, 10, 0))
+        config_shell.pack(side=tk.TOP, fill=tk.X)
+        self.config_toggle_button = ttk.Button(
+            config_shell,
+            text="Hide input configuration",
+            command=self.toggle_config_section,
+        )
+        self.config_toggle_button.pack(side=tk.TOP, anchor="w")
+
+        self.config_container = ttk.Frame(self.root, padding=(10, 2, 10, 4))
+        self.config_container.pack(side=tk.TOP, fill=tk.X)
+        self.config_frame = ttk.LabelFrame(self.config_container, text="Input configuration", padding=10)
+        self.config_frame.pack(side=tk.TOP, fill=tk.X)
+
+        linelist_frame = ttk.Frame(self.config_frame)
         linelist_frame.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(linelist_frame, text="YY line list").grid(row=0, column=0, sticky="w")
         ttk.Entry(linelist_frame, textvariable=self.yy_lines_path_var, width=86).grid(
@@ -348,20 +422,20 @@ class LineReviewerApp:
         )
         linelist_frame.grid_columnconfigure(1, weight=1)
 
-        spectrum_header = ttk.Frame(config)
+        spectrum_header = ttk.Frame(self.config_frame)
         spectrum_header.pack(side=tk.TOP, fill=tk.X, pady=(10, 2))
         ttk.Label(spectrum_header, text="Spectra to compare").pack(side=tk.LEFT)
         ttk.Button(spectrum_header, text="Add spectrum", command=self.add_spectrum_row).pack(side=tk.LEFT, padx=(10, 0))
 
-        self.spectra_rows_frame = ttk.Frame(config)
+        self.spectra_rows_frame = ttk.Frame(self.config_frame)
         self.spectra_rows_frame.pack(side=tk.TOP, fill=tk.X)
 
-        controls = ttk.Frame(self.root, padding=(10, 4, 10, 8))
-        controls.pack(side=tk.TOP, fill=tk.X)
+        self.controls_frame = ttk.Frame(self.root, padding=(10, 4, 10, 8))
+        self.controls_frame.pack(side=tk.TOP, fill=tk.X)
 
-        ttk.Label(controls, text="YY species").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.controls_frame, text="YY species").grid(row=0, column=0, sticky="w")
         self.species_box = ttk.Combobox(
-            controls,
+            self.controls_frame,
             textvariable=self.current_species,
             values=self.species_options,
             state="readonly",
@@ -370,26 +444,26 @@ class LineReviewerApp:
         self.species_box.grid(row=0, column=1, padx=(6, 12), sticky="w")
         self.species_box.bind("<<ComboboxSelected>>", lambda _event: self.apply_filters(reset_index=True))
 
-        ttk.Label(controls, text="Max min flux (dip)").grid(row=0, column=2, sticky="w")
-        ttk.Entry(controls, textvariable=self.peak_threshold_var, width=8).grid(row=0, column=3, padx=(6, 12))
+        ttk.Label(self.controls_frame, text="Max min flux (dip)").grid(row=0, column=2, sticky="w")
+        ttk.Entry(self.controls_frame, textvariable=self.peak_threshold_var, width=8).grid(row=0, column=3, padx=(6, 12))
 
-        ttk.Label(controls, text="Peak window (A)").grid(row=0, column=4, sticky="w")
-        ttk.Entry(controls, textvariable=self.peak_window_var, width=8).grid(row=0, column=5, padx=(6, 12))
+        ttk.Label(self.controls_frame, text="Peak window (A)").grid(row=0, column=4, sticky="w")
+        ttk.Entry(self.controls_frame, textvariable=self.peak_window_var, width=8).grid(row=0, column=5, padx=(6, 12))
 
-        ttk.Label(controls, text="View half-width (A)").grid(row=0, column=6, sticky="w")
-        ttk.Entry(controls, textvariable=self.view_width_var, width=8).grid(row=0, column=7, padx=(6, 12))
+        ttk.Label(self.controls_frame, text="View half-width (A)").grid(row=0, column=6, sticky="w")
+        ttk.Entry(self.controls_frame, textvariable=self.view_width_var, width=8).grid(row=0, column=7, padx=(6, 12))
 
-        ttk.Label(controls, text="Lower y-limit").grid(row=0, column=8, sticky="w")
-        ttk.Entry(controls, textvariable=self.y_min_var, width=8).grid(row=0, column=9, padx=(6, 12))
+        ttk.Label(self.controls_frame, text="Lower y-limit").grid(row=0, column=8, sticky="w")
+        ttk.Entry(self.controls_frame, textvariable=self.y_min_var, width=8).grid(row=0, column=9, padx=(6, 12))
 
-        ttk.Label(controls, text="Upper y-limit").grid(row=0, column=10, sticky="w")
-        ttk.Entry(controls, textvariable=self.y_max_var, width=8).grid(row=0, column=11, padx=(6, 12))
+        ttk.Label(self.controls_frame, text="Upper y-limit").grid(row=0, column=10, sticky="w")
+        ttk.Entry(self.controls_frame, textvariable=self.y_max_var, width=8).grid(row=0, column=11, padx=(6, 12))
 
-        ttk.Button(controls, text="Apply", command=self.apply_filters).grid(
+        ttk.Button(self.controls_frame, text="Apply", command=self.apply_filters).grid(
             row=0, column=12, padx=(0, 12)
         )
 
-        overlay_frame = ttk.Frame(controls)
+        overlay_frame = ttk.Frame(self.controls_frame)
         overlay_frame.grid(row=1, column=0, columnspan=9, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
             overlay_frame,
@@ -414,6 +488,7 @@ class LineReviewerApp:
         ttk.Button(nav, text="Next", command=self.next_line).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(nav, text="Keep", command=self.keep_current_line).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(nav, text="Remove kept", command=self.remove_current_line).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(nav, text="Reset EW bounds", command=self.reset_ew_bounds).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(nav, text="Show output path", command=self.show_output_path_message).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Label(nav, textvariable=self.status_var).pack(side=tk.LEFT, padx=(18, 0))
 
@@ -424,6 +499,10 @@ class LineReviewerApp:
         toolbar = NavigationToolbar2Tk(self.canvas, self.root, pack_toolbar=False)
         toolbar.update()
         toolbar.pack(side=tk.TOP, fill=tk.X)
+
+        self.canvas.mpl_connect("button_press_event", self.on_mouse_press)
+        self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
+        self.canvas.mpl_connect("button_release_event", self.on_mouse_release)
 
         self.root.bind("<Left>", lambda _event: self.previous_line())
         self.root.bind("<Right>", lambda _event: self.next_line())
@@ -571,6 +650,17 @@ class LineReviewerApp:
             if column_name in row.index:
                 record[column_name] = row[column_name]
 
+        ew_values = self.current_ew_values()
+        for key, value in ew_values.items():
+            record[key] = value
+
+        center = float(row["wavelength"])
+        for column_name in self.spectrum_flux_columns:
+            suffix = self._ew_name_suffix(column_name)
+            left, right = self._get_ew_bounds(column_name, center)
+            record[f"ew_left_{suffix}"] = left
+            record[f"ew_right_{suffix}"] = right
+
         if self.kept_lines.empty:
             self.kept_lines = record
         else:
@@ -581,6 +671,8 @@ class LineReviewerApp:
                 )
             ]
             self.kept_lines = pd.concat([remaining, record], ignore_index=True)
+
+        self._refresh_saved_integration_bounds()
 
         self.kept_lines = self.kept_lines.sort_values(["species", "wavelength"]).reset_index(drop=True)
         self.kept_lines.to_csv(output_path, index=False)
@@ -599,6 +691,7 @@ class LineReviewerApp:
                 & (np.isclose(self.kept_lines["wavelength"], row["wavelength"], atol=1e-6))
             )
         ].reset_index(drop=True)
+        self._refresh_saved_integration_bounds()
         self.kept_lines.to_csv(output_path, index=False)
         self.refresh_plot()
 
@@ -610,6 +703,150 @@ class LineReviewerApp:
         output_path = Path(self.output_var.get())
         if output_path != self.loaded_output_path:
             self.kept_lines = self._load_existing_output()
+            self._refresh_saved_integration_bounds()
+
+    def _ew_name_suffix(self, column_name: str) -> str:
+        return column_name.replace("min_flux_", "", 1)
+
+    def reset_ew_bounds(self) -> None:
+        row = self.current_line_row()
+        if row is None:
+            return
+        center = float(row["wavelength"])
+        self._initialize_ew_bounds(center)
+        self.refresh_plot()
+
+    def _initialize_ew_bounds(self, center: float) -> None:
+        self.integration_bounds = {
+            column_name: (center - 3 * self.active_peak_window, center + 3 * self.active_peak_window)
+            for column_name in self.spectrum_flux_columns
+        }
+
+    def _restore_ew_bounds(self, species: str, center: float) -> None:
+        self._initialize_ew_bounds(center)
+        saved_bounds = self.saved_integration_bounds.get((species, round(center, 6)), {})
+        for column_name, bounds in saved_bounds.items():
+            if column_name in self.integration_bounds:
+                self.integration_bounds[column_name] = self._clamp_bounds(bounds[0], bounds[1], center)
+
+    def _clamp_bounds(self, left: float, right: float, center: float) -> tuple[float, float]:
+        min_x = center - self.active_view_width
+        max_x = center + self.active_view_width
+        min_width = max(self.active_view_width * 1e-4, 1e-5)
+
+        left = float(np.clip(left, min_x, max_x))
+        right = float(np.clip(right, min_x, max_x))
+
+        if right - left < min_width:
+            midpoint = 0.5 * (left + right)
+            left = max(min_x, midpoint - 0.5 * min_width)
+            right = min(max_x, midpoint + 0.5 * min_width)
+            if right - left < min_width:
+                right = min(max_x, left + min_width)
+                left = max(min_x, right - min_width)
+
+        return left, right
+
+    def _get_ew_bounds(self, column_name: str, center: float) -> tuple[float, float]:
+        default_left = center - 3 * self.active_peak_window
+        default_right = center + 3 * self.active_peak_window
+        left, right = self.integration_bounds.get(column_name, (default_left, default_right))
+        left, right = self._clamp_bounds(left, right, center)
+        self.integration_bounds[column_name] = (left, right)
+        return left, right
+
+    def _integrate_equivalent_width(self, spectrum: Spectrum, left: float, right: float) -> float:
+        if left >= right:
+            return float("nan")
+
+        wave = spectrum.wavelength
+        flux = spectrum.flux
+        if wave.size < 2 or right < wave[0] or left > wave[-1]:
+            return float("nan")
+
+        lo = max(left, float(wave[0]))
+        hi = min(right, float(wave[-1]))
+        if lo >= hi:
+            return float("nan")
+
+        mask = (wave > lo) & (wave < hi)
+        segment_wave = wave[mask]
+        sample_wave = np.concatenate(([lo], segment_wave, [hi]))
+        sample_flux = np.interp(sample_wave, wave, flux)
+        integrand = 1.0 - sample_flux
+        return float(np.trapezoid(integrand, sample_wave))
+
+    def current_ew_values(self) -> dict[str, float]:
+        row = self.current_line_row()
+        if row is None:
+            return {}
+
+        center = float(row["wavelength"])
+        ew_values: dict[str, float] = {}
+        ew_scalar: list[float] = []
+
+        for spectrum, column_name in zip(self.spectra, self.spectrum_flux_columns):
+            left, right = self._get_ew_bounds(column_name, center)
+            ew = self._integrate_equivalent_width(spectrum, left, right)
+            suffix = self._ew_name_suffix(column_name)
+
+            ew_values[f"ew_{suffix}"] = ew
+
+            if not np.isnan(ew):
+                ew_scalar.append(ew)
+
+        ew_values["ew_mean"] = float(np.mean(ew_scalar)) if ew_scalar else float("nan")
+        return ew_values
+
+    def on_mouse_press(self, event: Any) -> None:
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+        row = self.current_line_row()
+        if row is None:
+            return
+
+        center = float(row["wavelength"])
+        x = float(event.xdata)
+        tolerance = max(0.02, self.active_view_width * 0.02)
+        candidates: list[tuple[float, str, str]] = []
+
+        for column_name in self.spectrum_flux_columns:
+            left, right = self._get_ew_bounds(column_name, center)
+            candidates.append((abs(x - left), column_name, "left"))
+            candidates.append((abs(x - right), column_name, "right"))
+
+        if not candidates:
+            return
+
+        distance, column_name, side = min(candidates, key=lambda item: item[0])
+        if distance <= tolerance:
+            self.dragging_handle = (column_name, side)
+
+    def on_mouse_move(self, event: Any) -> None:
+        if self.dragging_handle is None or event.inaxes != self.ax or event.xdata is None:
+            return
+        row = self.current_line_row()
+        if row is None:
+            return
+
+        column_name, side = self.dragging_handle
+        center = float(row["wavelength"])
+        min_x = center - self.active_view_width
+        max_x = center + self.active_view_width
+        min_width = max(self.active_view_width * 1e-4, 1e-5)
+        x = float(np.clip(event.xdata, min_x, max_x))
+
+        left, right = self._get_ew_bounds(column_name, center)
+        if side == "left":
+            left = min(x, right - min_width)
+        else:
+            right = max(x, left + min_width)
+
+        self.integration_bounds[column_name] = self._clamp_bounds(left, right, center)
+        self.refresh_plot()
+
+    def on_mouse_release(self, _event: Any) -> None:
+        self.dragging_handle = None
 
     def refresh_plot(self) -> None:
         self.ax.clear()
@@ -623,6 +860,11 @@ class LineReviewerApp:
             return
 
         wavelength = float(row["wavelength"])
+        line_key = (str(row["species"]), round(wavelength, 6))
+        if self.last_line_key != line_key:
+            self._restore_ew_bounds(str(row["species"]), wavelength)
+            self.last_line_key = line_key
+
         view_width = self.active_view_width
         peak_window = self.active_peak_window
 
@@ -633,6 +875,12 @@ class LineReviewerApp:
             self.ax.plot(wave, flux, color=color, linewidth=1.0, label=spectrum.label)
             if flux.size:
                 flux_segments.append(flux)
+
+            column_name = self.spectrum_flux_columns[index]
+            left, right = self._get_ew_bounds(column_name, wavelength)
+            self.ax.axvspan(left, right, color=color, alpha=0.06)
+            self.ax.axvline(left, color=color, linewidth=1.1, alpha=0.9)
+            self.ax.axvline(right, color=color, linewidth=1.1, linestyle="--", alpha=0.9)
         self.ax.axvline(wavelength, color="forestgreen", linewidth=1.8, label=f"Current yy line: {row['species']}")
 
         if self.show_other_yy_var.get():
@@ -678,8 +926,19 @@ class LineReviewerApp:
             if column_name in row.index:
                 minima_text_parts.append(f"{spectrum.label}={row[column_name]:.3f}")
         minima_text = "  ".join(minima_text_parts)
+
+        ew_values = self.current_ew_values()
+        self.last_ew_values = ew_values
+        ew_text_parts: list[str] = []
+        for spectrum, column_name in zip(self.spectra, self.spectrum_flux_columns):
+            suffix = self._ew_name_suffix(column_name)
+            ew_value = ew_values.get(f"ew_{suffix}", float("nan"))
+            ew_text_parts.append(f"{spectrum.label}={ew_value:.5f}A")
+        ew_text = "  ".join(ew_text_parts)
+        ew_mean = ew_values.get("ew_mean", float("nan"))
+
         self.status_var.set(
-            f"{self.current_index + 1}/{len(self.filtered_lines)}  |  {minima_text}  dip={row['min_flux']:.3f}  |  {kept_marker}  |  saved={len(self.kept_lines)}"
+            f"{self.current_index + 1}/{len(self.filtered_lines)}  |  {minima_text}  dip={row['min_flux']:.3f}  |  EW: {ew_text}  mean={ew_mean:.5f}A  |  {kept_marker}  |  saved={len(self.kept_lines)}"
         )
 
         self.ax.axvspan(wavelength - peak_window, wavelength + peak_window, color="forestgreen", alpha=0.06)
@@ -717,7 +976,7 @@ class LineReviewerApp:
 def main() -> None:
     root = tk.Tk()
     app = LineReviewerApp(root)
-    root.minsize(1150, 760)
+    root.minsize(1150, 600)
     root.mainloop()
 
 
