@@ -58,7 +58,11 @@ and the local RV, $c\,\Delta\lambda/\lambda$.
     and red side by more than 3 mÅ. This is a hint only: on HD 2454 Fe 1 it caught 14 of 19
     lines noted as blended, with 24 false alarms among 110 others.
 
-The panel above the plot shows how many lines are kept per species. Continuum, blend flag
+These controls take effect immediately, without **Apply**. For a line that is already kept,
+the output CSV is rewritten as soon as you change them (a comment once you stop typing), so
+there is no need to press Keep again.
+
+The navigation row shows how many lines are kept per species. Continuum, blend flag
 and comment are restored from the output CSV when you revisit a kept line.
 
 ### Shortcuts

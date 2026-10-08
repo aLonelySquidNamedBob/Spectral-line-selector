@@ -196,6 +196,7 @@ class LineReviewerApp:
         self.line_blended: dict[tuple[str, float], bool] = {}
         self.line_comment: dict[tuple[str, float], str] = {}
         self.loading_line_state = False
+        self.comment_save_job: str | None = None
         self.spectrum_cache: dict[Path, tuple[float, Spectrum]] = {}
 
         self._build_ui()
@@ -872,7 +873,7 @@ class LineReviewerApp:
             command=lambda _value: self._continuum_changed(),
         )
         self.continuum_scale.pack(side=tk.LEFT)
-        self.continuum_scale.bind("<ButtonRelease-1>", lambda _event: self._fit_current_line_if_needed())
+        self.continuum_scale.bind("<ButtonRelease-1>", lambda _event: self._continuum_released())
         ttk.Label(continuum_row, textvariable=self.continuum_label_var, width=7).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(continuum_row, text="Reset", width=6, command=self.reset_continuum).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Checkbutton(
@@ -1223,6 +1224,10 @@ class LineReviewerApp:
         self.continuum_label_var.set(f"{continuum:.4f}")
         self.refresh_plot()
 
+    def _continuum_released(self) -> None:
+        self._fit_current_line_if_needed()
+        self._update_kept_line()
+
     def reset_continuum(self) -> None:
         key = self.current_line_key()
         if key is None:
@@ -1231,11 +1236,22 @@ class LineReviewerApp:
         self._load_line_state(key)
         self._fit_current_line_if_needed()
         self.refresh_plot()
+        self._update_kept_line()
+
+    def _update_kept_line(self) -> None:
+        """Rewrite the current line in the output if it is already kept, so edits apply at once."""
+        if self.comment_save_job is not None:
+            self.root.after_cancel(self.comment_save_job)
+            self.comment_save_job = None
+        row = self.current_line_row()
+        if row is not None and self.is_kept(row["species"], float(row["wavelength"])):
+            self.keep_current_line()
 
     def _blended_changed(self) -> None:
         key = self.current_line_key()
         if key is not None and not self.loading_line_state:
             self.line_blended[key] = bool(self.blended_var.get())
+            self._update_kept_line()
 
     def toggle_blended(self) -> None:
         if self.current_line_key() is None:
@@ -1247,6 +1263,10 @@ class LineReviewerApp:
         key = self.current_line_key()
         if key is not None and not self.loading_line_state:
             self.line_comment[key] = self.comment_var.get()
+            # Save once typing pauses rather than rewriting the CSV on every keystroke.
+            if self.comment_save_job is not None:
+                self.root.after_cancel(self.comment_save_job)
+            self.comment_save_job = self.root.after(600, self._update_kept_line)
 
     def kept_counts_text(self) -> str:
         current = self.current_species.get()
@@ -1277,6 +1297,7 @@ class LineReviewerApp:
         return self.peak_cache[key]
 
     def apply_filters(self, reset_index: bool = False) -> None:
+        self._flush_pending_comment()
         previous_row = None if reset_index else self.current_line_row()
 
         try:
@@ -1346,9 +1367,15 @@ class LineReviewerApp:
             return None
         return self.filtered_lines.iloc[self.current_index]
 
+    def _flush_pending_comment(self) -> None:
+        # A comment still waiting to be saved belongs to the line shown now; save it before moving on.
+        if self.comment_save_job is not None:
+            self._update_kept_line()
+
     def previous_line(self) -> None:
         if self.filtered_lines.empty:
             return
+        self._flush_pending_comment()
         self.current_index = max(self.current_index - 1, 0)
         self._fit_current_line_if_needed()
         self.refresh_plot()
@@ -1356,6 +1383,7 @@ class LineReviewerApp:
     def next_line(self) -> None:
         if self.filtered_lines.empty:
             return
+        self._flush_pending_comment()
         self.current_index = min(self.current_index + 1, len(self.filtered_lines) - 1)
         self._fit_current_line_if_needed()
         self.refresh_plot()
