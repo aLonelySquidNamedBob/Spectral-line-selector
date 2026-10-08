@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -33,6 +34,13 @@ DEFAULT_VOIGT_GAMMA = 0.05
 DEFAULT_VOIGT_SHIFT = 0.0
 DEFAULT_VOIGT_FIT_WIDTH = 0.2
 ANGSTROM_TO_MILLIANGSTROM = 1000.0
+MEASUREMENT_MODES = ["EW", "Manual Voigt", "Fit Voigt"]
+DEFAULT_MEASUREMENT_MODE = "Fit Voigt"
+# Left, right, bottom, top; wide enough for tick labels, the axis labels and the title.
+PLOT_MARGINS_INCHES = (0.8, 0.5, 0.65, 0.45)
+TEXT_INPUT_CLASSES = {"Entry", "TEntry", "Spinbox", "TSpinbox", "TCombobox"}
+# np.trapezoid only exists from NumPy 2.0; np.trapz is the same rule on older versions.
+TRAPEZOID = getattr(np, "trapezoid", None) or np.trapz
 SPECTRUM_COLOR_CYCLE = [
     "steelblue",
     "tomato",
@@ -42,12 +50,13 @@ SPECTRUM_COLOR_CYCLE = [
     "royalblue",
     "goldenrod",
 ]
+# Fixed-width columns of the GES line list (.dat), checked against geslines.dat (80 612 records).
 GES_ION_SLICE = slice(0, 4)
 GES_WAVELENGTH_SLICE = slice(9, 18)
 GES_GFFLAG_INDEX = 83
 GES_SYNFLAG_INDEX = 85
 GES_LOW_ENERGY_SLICE = slice(185, 191)
-GES_UPPER_ENERGY_SLICE = slice(299, 350)
+GES_UPPER_ENERGY_SLICE = slice(299, 305)
 
 # CLASSES
 
@@ -88,9 +97,6 @@ class LineReviewerApp:
         self.configuration_path = Path(__file__).with_name(CONFIGURATION_NAME)
         configuration = self._load_configuration(self.configuration_path)
 
-        self.project_root = Path(__file__).resolve().parent.parent
-        self.results_dir = self.project_root / "6_python stuff" / "results"
-        self.output_path = Path(configuration.get("output", ""))
         self.default_spectra = [
             (str(item.get("label", "")), Path(str(item.get("path", ""))))
             for item in configuration.get("spectra", [])
@@ -117,9 +123,7 @@ class LineReviewerApp:
         self.output_var = tk.StringVar(value=str(configuration.get("output", "")))
         self.show_other_yy_var = tk.BooleanVar(value=bool(configuration.get("show_other_yy", True)))
         self.show_non_yy_var = tk.BooleanVar(value=bool(configuration.get("show_non_yy", True)))
-        self.measurement_mode_var = tk.StringVar(value=str(configuration.get("measurement_mode", "Fit Voigt")))
-        if self.measurement_mode_var.get() not in {"EW", "Manual Voigt", "Fit Voigt"}:
-            self.measurement_mode_var.set("Fit Voigt")
+        self.measurement_mode_var = tk.StringVar(value=self._configuration_mode(configuration))
         self.voigt_depth_var = tk.DoubleVar(value=self._configuration_float(configuration, "voigt_depth", DEFAULT_VOIGT_DEPTH))
         self.voigt_sigma_var = tk.DoubleVar(value=self._configuration_float(configuration, "voigt_sigma", DEFAULT_VOIGT_SIGMA))
         self.voigt_gamma_var = tk.DoubleVar(value=self._configuration_float(configuration, "voigt_gamma", DEFAULT_VOIGT_GAMMA))
@@ -129,8 +133,9 @@ class LineReviewerApp:
         self.voigt_sigma_label_var = tk.StringVar()
         self.voigt_gamma_label_var = tk.StringVar()
         self.voigt_shift_label_var = tk.StringVar()
-        self.voigt_fit_width_label_var = tk.StringVar()
         self.status_var = tk.StringVar(value="")
+        self.position_var = tk.StringVar(value="")
+        self.kept_state_var = tk.StringVar(value="")
         self.active_peak_threshold = DEFAULT_PEAK_THRESHOLD
         self.active_peak_window = DEFAULT_PEAK_WINDOW
         self.active_view_width = DEFAULT_VIEW_WIDTH
@@ -149,11 +154,13 @@ class LineReviewerApp:
         self.integration_bounds: dict[str, tuple[float, float]] = {}
         self.dragging_handle: tuple[str, str] | None = None
         self.last_line_key: tuple[str, float] | None = None
-        self.last_ew_values: dict[str, float] = {}
         self.last_voigt_area = float("nan")
-        self.fitted_voigt_parameters: dict[str, tuple[float, float, float, float]] = {}
-        self.fitted_voigt_areas: dict[str, float] = {}
+        # Fit results are keyed by spectrum index: labels are free text and may repeat.
+        self.fitted_voigt_parameters: dict[int, tuple[float, float, float, float]] = {}
+        self.fitted_voigt_areas: dict[int, float] = {}
         self.fitted_voigt_line_key: tuple[str, float] | None = None
+        self.fitted_voigt_bounds: tuple[float, float] | None = None
+        self.spectrum_cache: dict[Path, tuple[float, Spectrum]] = {}
 
         self._build_ui()
 
@@ -168,6 +175,10 @@ class LineReviewerApp:
             self.apply_filters(reset_index=True)
         else:
             self.status_var.set("Configure input files and click Apply")
+
+    def _configuration_mode(self, configuration: dict[str, Any]) -> str:
+        mode = str(configuration.get("measurement_mode", DEFAULT_MEASUREMENT_MODE))
+        return mode if mode in MEASUREMENT_MODES else DEFAULT_MEASUREMENT_MODE
 
     def _configuration_float(self, configuration: dict[str, Any], key: str, default: float) -> float:
         try:
@@ -261,9 +272,7 @@ class LineReviewerApp:
             variable.set(str(configuration.get(key, default)))
         self.show_other_yy_var.set(bool(configuration.get("show_other_yy", True)))
         self.show_non_yy_var.set(bool(configuration.get("show_non_yy", True)))
-        self.measurement_mode_var.set(str(configuration.get("measurement_mode", "Fit Voigt")))
-        if self.measurement_mode_var.get() not in {"EW", "Manual Voigt", "Fit Voigt"}:
-            self.measurement_mode_var.set("Fit Voigt")
+        self.measurement_mode_var.set(self._configuration_mode(configuration))
         self.voigt_depth_var.set(self._configuration_float(configuration, "voigt_depth", DEFAULT_VOIGT_DEPTH))
         self.voigt_sigma_var.set(self._configuration_float(configuration, "voigt_sigma", DEFAULT_VOIGT_SIGMA))
         self.voigt_gamma_var.set(self._configuration_float(configuration, "voigt_gamma", DEFAULT_VOIGT_GAMMA))
@@ -305,11 +314,31 @@ class LineReviewerApp:
         used.add(candidate)
         return candidate
 
+    def _read_table(self, path: Path) -> pd.DataFrame:
+        # Sniff the delimiter from the header only, then parse with the fast C engine;
+        # sep=None with the python engine is very slow on large spectra.
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as table_file:
+            sample = "".join(table_file.readline() for _ in range(5))
+        try:
+            delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t ").delimiter
+        except csv.Error:
+            delimiter = ","
+        if delimiter == " ":
+            return pd.read_csv(path, sep=r"\s+")
+        return pd.read_csv(path, sep=delimiter)
+
     def _load_spectrum(self, path: Path, label: str) -> Spectrum:
         if not path.exists():
             raise ValueError(f"Spectrum file not found: {path}")
 
-        frame = pd.read_csv(path, sep=None, engine="python")
+        resolved = path.resolve()
+        modified = resolved.stat().st_mtime
+        cached = self.spectrum_cache.get(resolved)
+        if cached is not None and cached[0] == modified:
+            spectrum = cached[1]
+            return Spectrum(wavelength=spectrum.wavelength, flux=spectrum.flux, label=label)
+
+        frame = self._read_table(path)
         wavelength_col = self._find_column(frame.columns.tolist(), ["Wavelength", "wavelength", "wave"])
         flux_col = self._find_column(frame.columns.tolist(), ["normed_flux", "Flux", "flux"])
 
@@ -331,13 +360,15 @@ class LineReviewerApp:
         wavelength = wavelength[order]
         flux = flux[order]
 
-        return Spectrum(
+        spectrum = Spectrum(
             wavelength=wavelength,
             flux=flux,
             label=label,
         )
+        self.spectrum_cache[resolved] = (modified, spectrum)
+        return spectrum
 
-    def _load_line_list(self, path_text: str, name: str, required: bool) -> pd.DataFrame:
+    def _load_line_list(self, path_text: str, name: str, required: bool, yy_selection: bool) -> pd.DataFrame:
         stripped = path_text.strip()
         if not stripped:
             if required:
@@ -352,7 +383,7 @@ class LineReviewerApp:
             return pd.DataFrame(columns=["species", "wavelength"])
 
         if path.suffix.lower() == ".dat":
-            loaded = self._load_ges_line_list(path, name.lower().startswith("yy"))
+            loaded = self._load_ges_line_list(path, yy_selection)
             if required and loaded.empty:
                 raise ValueError(f"{name} has no valid matching lines after parsing.")
             return loaded
@@ -406,12 +437,15 @@ class LineReviewerApp:
             raise ValueError(f"Could not read GES line list {path}: {exc}") from exc
 
         for line_number, line in enumerate(lines, start=1):
-            if len(line) < GES_UPPER_ENERGY_SLICE.start:
+            if len(line) < GES_UPPER_ENERGY_SLICE.stop:
                 continue
 
             gfflag = line[GES_GFFLAG_INDEX].strip()
             synflag = line[GES_SYNFLAG_INDEX].strip()
-            if yy_selection and not (gfflag == "Y" and synflag in {"Y", "U"}):
+            # The YY list keeps the well-flagged lines; the reference list is its complement,
+            # so the same .dat file can be used for both without drawing YY lines twice.
+            is_yy = gfflag == "Y" and synflag in {"Y", "U"}
+            if is_yy != yy_selection:
                 continue
 
             species = line[GES_ION_SLICE].strip()
@@ -457,8 +491,8 @@ class LineReviewerApp:
         yy_path_text = self.yy_lines_path_var.get().strip()
         non_yy_path_text = self.non_yy_lines_path_var.get().strip()
 
-        yy_lines = self._load_line_list(yy_path_text, "YY line list", required=True)
-        non_yy_lines = self._load_line_list(non_yy_path_text, "Non-yy line list", required=False)
+        yy_lines = self._load_line_list(yy_path_text, "YY line list", required=True, yy_selection=True)
+        non_yy_lines = self._load_line_list(non_yy_path_text, "Non-yy line list", required=False, yy_selection=False)
 
         spectra: list[Spectrum] = []
         spectrum_flux_columns: list[str] = []
@@ -629,6 +663,10 @@ class LineReviewerApp:
         self.set_config_visibility(not self.config_visible)
 
     def _build_ui(self) -> None:
+        style = ttk.Style(self.root)
+        style.configure("Position.TLabel", font=("TkDefaultFont", 10, "bold"))
+        style.configure("Status.TLabel", padding=(8, 3))
+
         config_shell = ttk.Frame(self.root, padding=(10, 10, 10, 0))
         config_shell.pack(side=tk.TOP, fill=tk.X)
         config_buttons = ttk.Frame(config_shell)
@@ -658,26 +696,24 @@ class LineReviewerApp:
         linelist_frame.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(linelist_frame, text="YY line list").grid(row=0, column=0, sticky="w")
         ttk.Entry(linelist_frame, textvariable=self.yy_lines_path_var, width=86).grid(
-            row=0,
-            column=1,
-            padx=(6, 6),
-            sticky="ew",
+            row=0, column=1, padx=(6, 6), sticky="ew"
         )
         ttk.Button(linelist_frame, text="Browse", command=self.browse_yy_lines).grid(row=0, column=2, sticky="w")
 
         ttk.Label(linelist_frame, text="Non-yy line list").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(linelist_frame, textvariable=self.non_yy_lines_path_var, width=86).grid(
-            row=1,
-            column=1,
-            padx=(6, 6),
-            pady=(6, 0),
-            sticky="ew",
+            row=1, column=1, padx=(6, 6), pady=(6, 0), sticky="ew"
         )
         ttk.Button(linelist_frame, text="Browse", command=self.browse_non_yy_lines).grid(
-            row=1,
-            column=2,
-            sticky="w",
-            pady=(6, 0),
+            row=1, column=2, sticky="w", pady=(6, 0)
+        )
+
+        ttk.Label(linelist_frame, text="Output CSV").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(linelist_frame, textvariable=self.output_var, width=86).grid(
+            row=2, column=1, padx=(6, 6), pady=(6, 0), sticky="ew"
+        )
+        ttk.Button(linelist_frame, text="Browse", command=self.browse_output).grid(
+            row=2, column=2, sticky="w", pady=(6, 0)
         )
         linelist_frame.grid_columnconfigure(1, weight=1)
 
@@ -689,107 +725,155 @@ class LineReviewerApp:
         self.spectra_rows_frame = ttk.Frame(self.config_frame)
         self.spectra_rows_frame.pack(side=tk.TOP, fill=tk.X)
 
-        self.controls_frame = ttk.Frame(self.root, padding=(10, 4, 10, 8))
+        self.controls_frame = ttk.Frame(self.root, padding=(10, 4, 10, 4))
         self.controls_frame.pack(side=tk.TOP, fill=tk.X)
 
-        ttk.Label(self.controls_frame, text="YY species").grid(row=0, column=0, sticky="w")
+        selection_frame = ttk.LabelFrame(self.controls_frame, text="Line selection", padding=(8, 4))
+        selection_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ttk.Label(selection_frame, text="Species").grid(row=0, column=0, sticky="w")
         self.species_box = ttk.Combobox(
-            self.controls_frame,
+            selection_frame,
             textvariable=self.current_species,
             values=self.species_options,
             state="readonly",
-            width=18,
+            width=10,
         )
-        self.species_box.grid(row=0, column=1, padx=(6, 12), sticky="w")
+        self.species_box.grid(row=0, column=1, padx=(6, 0), sticky="w")
         self.species_box.bind("<<ComboboxSelected>>", lambda _event: self.apply_filters(reset_index=True))
-
-        ttk.Label(self.controls_frame, text="Max min flux (dip)").grid(row=0, column=2, sticky="w")
-        ttk.Entry(self.controls_frame, textvariable=self.peak_threshold_var, width=8).grid(row=0, column=3, padx=(6, 12))
-
-        ttk.Label(self.controls_frame, text="Peak window (A)").grid(row=0, column=4, sticky="w")
-        ttk.Entry(self.controls_frame, textvariable=self.peak_window_var, width=8).grid(row=0, column=5, padx=(6, 12))
-
-        ttk.Label(self.controls_frame, text="View half-width (A)").grid(row=0, column=6, sticky="w")
-        ttk.Entry(self.controls_frame, textvariable=self.view_width_var, width=8).grid(row=0, column=7, padx=(6, 12))
-
-        ttk.Label(self.controls_frame, text="Lower y-limit").grid(row=0, column=8, sticky="w")
-        ttk.Entry(self.controls_frame, textvariable=self.y_min_var, width=8).grid(row=0, column=9, padx=(6, 12))
-
-        ttk.Label(self.controls_frame, text="Upper y-limit").grid(row=0, column=10, sticky="w")
-        ttk.Entry(self.controls_frame, textvariable=self.y_max_var, width=8).grid(row=0, column=11, padx=(6, 12))
-
-        ttk.Button(self.controls_frame, text="Apply", command=self.apply_filters).grid(
-            row=0, column=12, padx=(0, 12)
+        ttk.Label(selection_frame, text="Min. flux in dip").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(selection_frame, textvariable=self.peak_threshold_var, width=8).grid(
+            row=1, column=1, padx=(6, 0), pady=(4, 0), sticky="w"
+        )
+        ttk.Label(selection_frame, text="Dip half-window (Å)").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(selection_frame, textvariable=self.peak_window_var, width=8).grid(
+            row=2, column=1, padx=(6, 0), pady=(4, 0), sticky="w"
         )
 
-        overlay_frame = ttk.Frame(self.controls_frame)
-        overlay_frame.grid(row=1, column=0, columnspan=9, sticky="w", pady=(8, 0))
+        view_frame = ttk.LabelFrame(self.controls_frame, text="View", padding=(8, 4))
+        view_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+        ttk.Label(view_frame, text="Half-width (Å)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(view_frame, textvariable=self.view_width_var, width=8).grid(row=0, column=1, padx=(6, 0), sticky="w")
+        ttk.Label(view_frame, text="Flux range").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        y_range = ttk.Frame(view_frame)
+        y_range.grid(row=1, column=1, padx=(6, 0), pady=(4, 0), sticky="w")
+        ttk.Entry(y_range, textvariable=self.y_min_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(y_range, text="to").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(y_range, textvariable=self.y_max_var, width=6).pack(side=tk.LEFT)
+        overlay_frame = ttk.Frame(view_frame)
+        overlay_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Checkbutton(
-            overlay_frame,
-            text="Show other yy lines",
-            variable=self.show_other_yy_var,
-            command=self.refresh_plot,
+            overlay_frame, text="Other yy lines", variable=self.show_other_yy_var, command=self.refresh_plot
         ).pack(side=tk.LEFT)
         ttk.Checkbutton(
-            overlay_frame,
-            text="Show non-yy lines",
-            variable=self.show_non_yy_var,
-            command=self.refresh_plot,
-        ).pack(side=tk.LEFT, padx=(12, 0))
+            overlay_frame, text="Non-yy lines", variable=self.show_non_yy_var, command=self.refresh_plot
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
-        voigt_frame = ttk.Frame(self.controls_frame)
-        voigt_frame.grid(row=2, column=0, columnspan=13, sticky="w", pady=(8, 0))
-        ttk.Label(voigt_frame, text="Measurement").pack(side=tk.LEFT)
+        measurement_frame = ttk.LabelFrame(self.controls_frame, text="Measurement", padding=(8, 4))
+        measurement_frame.grid(row=0, column=2, sticky="nsew", padx=(0, 8))
+        mode_row = ttk.Frame(measurement_frame)
+        mode_row.grid(row=0, column=0, sticky="w")
+        ttk.Label(mode_row, text="Mode").pack(side=tk.LEFT)
         self.measurement_mode_box = ttk.Combobox(
-            voigt_frame,
+            mode_row,
             textvariable=self.measurement_mode_var,
-            values=["EW", "Manual Voigt", "Fit Voigt"],
+            values=MEASUREMENT_MODES,
             state="readonly",
-            width=14,
+            width=13,
         )
         self.measurement_mode_box.pack(side=tk.LEFT, padx=(6, 8))
         self.measurement_mode_box.bind("<<ComboboxSelected>>", lambda _event: self.measurement_mode_changed())
-        self.manual_voigt_controls = ttk.Frame(voigt_frame)
-        self.manual_voigt_controls.pack(side=tk.LEFT)
-        self._add_voigt_scale(self.manual_voigt_controls, "Depth", self.voigt_depth_var, 0.0, 1.0, self.voigt_depth_label_var)
-        self._add_voigt_scale(self.manual_voigt_controls, "Sigma (A)", self.voigt_sigma_var, 0.001, 0.3, self.voigt_sigma_label_var)
-        self._add_voigt_scale(self.manual_voigt_controls, "Gamma (A)", self.voigt_gamma_var, 0.001, 0.3, self.voigt_gamma_label_var)
-        self._add_voigt_scale(self.manual_voigt_controls, "Shift (A)", self.voigt_shift_var, -0.1, 0.1, self.voigt_shift_label_var)
-        self.fit_voigt_button = ttk.Button(voigt_frame, text="Fit Voigt", command=self.fit_voigt)
-        self.fit_voigt_button.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.manual_voigt_controls = ttk.Frame(measurement_frame)
+        self.manual_voigt_controls.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self._add_voigt_scale(self.manual_voigt_controls, 0, 0, "Depth", self.voigt_depth_var, 0.0, 1.0, self.voigt_depth_label_var)
+        self._add_voigt_scale(self.manual_voigt_controls, 0, 1, "Shift (Å)", self.voigt_shift_var, -0.1, 0.1, self.voigt_shift_label_var)
+        self._add_voigt_scale(self.manual_voigt_controls, 1, 0, "σ (Å)", self.voigt_sigma_var, 0.001, 0.3, self.voigt_sigma_label_var)
+        self._add_voigt_scale(self.manual_voigt_controls, 1, 1, "γ (Å)", self.voigt_gamma_var, 0.001, 0.3, self.voigt_gamma_label_var)
+
+        self.fit_controls = ttk.Frame(measurement_frame)
+        self.fit_controls.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(self.fit_controls, text="Initial fit half-width (Å)").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            self.fit_controls,
+            textvariable=self.voigt_fit_width_var,
+            from_=0.01,
+            to=5.0,
+            increment=0.01,
+            width=6,
+        ).pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Button(self.fit_controls, text="Refit", command=self.fit_voigt).pack(side=tk.LEFT)
         self._update_voigt_labels()
 
-        ttk.Label(overlay_frame, text="Output CSV").pack(side=tk.LEFT, padx=(18, 6))
-        ttk.Entry(overlay_frame, textvariable=self.output_var, width=55).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(overlay_frame, text="Browse", command=self.browse_output).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(self.controls_frame, text="Apply", command=self.apply_filters).grid(
+            row=0, column=3, sticky="s", pady=(0, 4)
+        )
 
-        nav = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        nav = ttk.Frame(self.root, padding=(10, 2, 10, 6))
         nav.pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(nav, text="Previous", command=self.previous_line).pack(side=tk.LEFT)
-        ttk.Button(nav, text="Next", command=self.next_line).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(nav, text="Keep", command=self.keep_current_line).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Button(nav, text="Remove kept", command=self.remove_current_line).pack(side=tk.LEFT, padx=(6, 0))
-        self.reset_bounds_button = ttk.Button(nav, text="Reset active bounds", command=self.reset_active_bounds)
-        self.reset_bounds_button.pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Button(nav, text="Show output path", command=self.show_output_path_message).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Label(nav, textvariable=self.status_var).pack(side=tk.LEFT, padx=(18, 0))
+        ttk.Button(nav, text="Previous [Left]", command=self.previous_line).pack(side=tk.LEFT)
+        ttk.Button(nav, text="Next [Right]", command=self.next_line).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(nav, text="Keep [Enter]", command=self.keep_current_line).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Button(nav, text="Remove kept [Del]", command=self.remove_current_line).pack(side=tk.LEFT, padx=(6, 0))
+        self.reset_bounds_button = ttk.Button(nav, text="Reset bounds", command=self.reset_active_bounds)
+        self.reset_bounds_button.pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Button(nav, text="Show output path", command=self.show_output_path_message).pack(side=tk.LEFT, padx=(6, 0))
+        self.kept_state_label = ttk.Label(nav, textvariable=self.kept_state_var, style="Position.TLabel")
+        self.kept_state_label.pack(side=tk.RIGHT)
+        ttk.Label(nav, textvariable=self.position_var, style="Position.TLabel").pack(side=tk.RIGHT, padx=(0, 16))
         self._update_mode_controls()
 
-        figure = Figure(figsize=(13, 7), dpi=100)
-        self.ax = figure.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(figure, master=self.root)
-        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        ttk.Label(
+            self.root, textvariable=self.status_var, style="Status.TLabel", relief=tk.SUNKEN, anchor="w"
+        ).pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Fixed margins instead of a tight layout: a tight layout re-fits the axes to the title
+        # and tick labels on every draw, so the plot jumped when they changed.
+        self.figure = Figure(figsize=(13, 7), dpi=100)
+        self.ax = self.figure.add_subplot(111)
+        self._apply_plot_margins()
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.root)
+        # Pack the toolbar before the canvas so it is not squeezed out when the window shrinks.
         toolbar = NavigationToolbar2Tk(self.canvas, self.root, pack_toolbar=False)
         toolbar.update()
-        toolbar.pack(side=tk.TOP, fill=tk.X)
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+        self.canvas.mpl_connect("resize_event", self._apply_plot_margins)
         self.canvas.mpl_connect("button_press_event", self.on_mouse_press)
         self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
         self.canvas.mpl_connect("button_release_event", self.on_mouse_release)
 
-        self.root.bind("<Left>", lambda _event: self.previous_line())
-        self.root.bind("<Right>", lambda _event: self.next_line())
-        self.root.bind("<Return>", lambda _event: self.keep_current_line())
+        # Bound on the root window, so they also fire while a text field has focus;
+        # _shortcut ignores them there so typing never navigates or keeps a line.
+        self.root.bind("<Left>", self._shortcut(self.previous_line))
+        self.root.bind("<Right>", self._shortcut(self.next_line))
+        self.root.bind("<Delete>", self._shortcut(self.remove_current_line))
+        self.root.bind("<Return>", self._shortcut(self.keep_current_line, in_text_field=self.apply_filters))
+        self.root.bind("<KP_Enter>", self._shortcut(self.keep_current_line, in_text_field=self.apply_filters))
+
+    def _apply_plot_margins(self, _event: Any = None) -> None:
+        # Margins are fixed in inches so the axes keep their place when the window is resized.
+        width, height = self.figure.get_size_inches()
+        if width <= 0 or height <= 0:
+            return
+        left, right, bottom, top = PLOT_MARGINS_INCHES
+        self.figure.subplots_adjust(
+            left=min(left / width, 0.3),
+            right=1.0 - min(right / width, 0.3),
+            bottom=min(bottom / height, 0.3),
+            top=1.0 - min(top / height, 0.3),
+        )
+
+    def _shortcut(self, action: Any, in_text_field: Any = None) -> Any:
+        def handler(event: Any) -> None:
+            widget_class = event.widget.winfo_class() if hasattr(event.widget, "winfo_class") else ""
+            if widget_class in TEXT_INPUT_CLASSES:
+                if in_text_field is not None:
+                    in_text_field()
+                return
+            action()
+
+        return handler
 
     def parse_float(self, value: str, field_name: str) -> float:
         try:
@@ -800,30 +884,32 @@ class LineReviewerApp:
     def _add_voigt_scale(
         self,
         parent: ttk.Frame,
+        row: int,
+        column: int,
         label: str,
         variable: tk.DoubleVar,
         minimum: float,
         maximum: float,
         value_label: tk.StringVar,
     ) -> None:
-        ttk.Label(parent, text=label).pack(side=tk.LEFT, padx=(10, 3))
+        base = 3 * column
+        ttk.Label(parent, text=label).grid(row=row, column=base, sticky="w", padx=(0 if column == 0 else 12, 4))
         ttk.Scale(
             parent,
             from_=minimum,
             to=maximum,
             variable=variable,
             orient=tk.HORIZONTAL,
-            length=90,
+            length=120,
             command=lambda _value: self._voigt_slider_changed(),
-        ).pack(side=tk.LEFT)
-        ttk.Label(parent, textvariable=value_label, width=7).pack(side=tk.LEFT, padx=(2, 0))
+        ).grid(row=row, column=base + 1, sticky="ew")
+        ttk.Label(parent, textvariable=value_label, width=7).grid(row=row, column=base + 2, sticky="w", padx=(2, 0))
 
     def _update_voigt_labels(self) -> None:
         self.voigt_depth_label_var.set(f"{self.voigt_depth_var.get():.3f}")
         self.voigt_sigma_label_var.set(f"{self.voigt_sigma_var.get():.4f}")
         self.voigt_gamma_label_var.set(f"{self.voigt_gamma_var.get():.4f}")
         self.voigt_shift_label_var.set(f"{self.voigt_shift_var.get():+.4f}")
-        self.voigt_fit_width_label_var.set(f"{self.voigt_fit_width_var.get():.3f}")
 
     def _voigt_slider_changed(self) -> None:
         self._update_voigt_labels()
@@ -841,20 +927,13 @@ class LineReviewerApp:
             self.fit_voigt(show_warning=False)
 
     def _update_mode_controls(self) -> None:
-        if self.measurement_mode_var.get() == "Manual Voigt":
-            if not self.manual_voigt_controls.winfo_manager():
-                self.manual_voigt_controls.pack(side=tk.LEFT)
-        elif self.manual_voigt_controls.winfo_manager():
-            self.manual_voigt_controls.pack_forget()
-        if self.measurement_mode_var.get() == "Manual Voigt":
-            self.reset_bounds_button.configure(state=tk.DISABLED)
-        else:
-            self.reset_bounds_button.configure(state=tk.NORMAL)
-        if self.measurement_mode_var.get() == "Fit Voigt":
-            if not self.fit_voigt_button.winfo_manager():
-                self.fit_voigt_button.pack(side=tk.LEFT, padx=(10, 0))
-        elif self.fit_voigt_button.winfo_manager():
-            self.fit_voigt_button.pack_forget()
+        mode = self.measurement_mode_var.get()
+        for frame, visible in ((self.manual_voigt_controls, mode == "Manual Voigt"), (self.fit_controls, mode == "Fit Voigt")):
+            if visible:
+                frame.grid()
+            else:
+                frame.grid_remove()
+        self.reset_bounds_button.configure(state=tk.DISABLED if mode == "Manual Voigt" else tk.NORMAL)
 
     def parse_optional_float(self, value: str, field_name: str) -> float | None:
         stripped = value.strip()
@@ -869,6 +948,15 @@ class LineReviewerApp:
         if depth < 0 or sigma <= 0 or gamma <= 0:
             raise ValueError("Voigt depth must be non-negative; sigma and gamma must be positive.")
         return depth, sigma, gamma
+
+    def fit_half_width(self) -> float:
+        try:
+            width = float(self.voigt_fit_width_var.get())
+        except (tk.TclError, ValueError) as exc:
+            raise ValueError("Fit half-width must be a number.") from exc
+        if width <= 0:
+            raise ValueError("Fit half-width must be positive.")
+        return width
 
     def voigt_values(self, wavelength: float, x: np.ndarray) -> tuple[np.ndarray, float]:
         depth, sigma, gamma = self.voigt_parameters()
@@ -899,9 +987,7 @@ class LineReviewerApp:
 
         try:
             depth, sigma, gamma = self.voigt_parameters()
-            fit_width = float(self.voigt_fit_width_var.get())
-            if fit_width <= 0:
-                raise ValueError("Voigt fit region must be positive.")
+            self.fit_half_width()
         except ValueError as exc:
             messagebox.showerror("Invalid Voigt parameters", str(exc))
             return
@@ -910,8 +996,8 @@ class LineReviewerApp:
         line_key = (str(row["species"]), round(center, 6))
         fit_left, fit_right = self._get_fit_bounds(str(row["species"]), center)
         fit_width = max(center - fit_left, fit_right - center)
-        fitted_parameters: dict[str, tuple[float, float, float, float]] = {}
-        fitted_areas: dict[str, float] = {}
+        fitted_parameters: dict[int, tuple[float, float, float, float]] = {}
+        fitted_areas: dict[int, float] = {}
         failures: list[str] = []
         initial = [
             depth,
@@ -919,9 +1005,10 @@ class LineReviewerApp:
             min(gamma, fit_width * 0.8),
             float(self.voigt_shift_var.get()),
         ]
-        bounds = ([0.0, 1e-5, 1e-5, -0.1], [2.0, fit_width, fit_width, 0.1])
+        # Depth is capped at 1: deeper would mean negative flux in a normalised spectrum.
+        bounds = ([0.0, 1e-5, 1e-5, -0.1], [1.0, fit_width, fit_width, 0.1])
 
-        for spectrum in self.spectra:
+        for index, spectrum in enumerate(self.spectra):
             left_index, right_index = spectrum.bounds(center, fit_width)
             wave = spectrum.wavelength[left_index:right_index]
             flux = spectrum.flux[left_index:right_index]
@@ -950,13 +1037,16 @@ class LineReviewerApp:
                 continue
 
             fit_depth, fit_sigma, fit_gamma, fit_shift = map(float, parameters)
-            fitted_parameters[spectrum.label] = (fit_depth, fit_sigma, fit_gamma, fit_shift)
-            fitted_areas[spectrum.label] = fit_depth / float(voigt_profile(0.0, fit_sigma, fit_gamma))
+            fitted_parameters[index] = (fit_depth, fit_sigma, fit_gamma, fit_shift)
+            fitted_areas[index] = fit_depth / float(voigt_profile(0.0, fit_sigma, fit_gamma))
 
         self.fitted_voigt_parameters = fitted_parameters
         self.fitted_voigt_areas = fitted_areas
         self.fitted_voigt_line_key = line_key
-        self.measurement_mode_var.set("Fit Voigt")
+        self.fitted_voigt_bounds = (fit_left, fit_right)
+        if self.measurement_mode_var.get() != "Fit Voigt":
+            self.measurement_mode_var.set("Fit Voigt")
+            self._update_mode_controls()
         self.refresh_plot()
         if failures and show_warning:
             messagebox.showwarning("Voigt fit incomplete", f"No fit was found for: {', '.join(failures)}")
@@ -982,8 +1072,8 @@ class LineReviewerApp:
         previous_row = None if reset_index else self.current_line_row()
 
         try:
-            peak_threshold = self.parse_float(self.peak_threshold_var.get(), "Min peak flux")
-            peak_window = self.parse_float(self.peak_window_var.get(), "Peak window")
+            peak_threshold = self.parse_float(self.peak_threshold_var.get(), "Min. flux in dip")
+            peak_window = self.parse_float(self.peak_window_var.get(), "Dip half-window")
             view_width = self.parse_float(self.view_width_var.get(), "View half-width")
             y_min = self.parse_optional_float(self.y_min_var.get(), "Lower y-limit")
             y_max = self.parse_optional_float(self.y_max_var.get(), "Upper y-limit")
@@ -993,7 +1083,7 @@ class LineReviewerApp:
             return
 
         if peak_window <= 0 or view_width <= 0:
-            messagebox.showerror("Invalid input", "Peak window and view half-width must be positive.")
+            messagebox.showerror("Invalid input", "Dip half-window and view half-width must be positive.")
             return
 
         self.active_peak_threshold = peak_threshold
@@ -1084,6 +1174,17 @@ class LineReviewerApp:
         output_path = Path(output_text)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        center = float(row["wavelength"])
+        line_key = (str(row["species"]), round(center, 6))
+        mode = self.measurement_mode_var.get()
+        if mode == "Fit Voigt" and (
+            self.fitted_voigt_line_key != line_key
+            or self.fitted_voigt_bounds != self._get_fit_bounds(line_key[0], center)
+        ):
+            # The fit is stale (bounds were dragged or no fit yet): refit so the saved
+            # parameters always belong to the saved fit region.
+            self.fit_voigt(show_warning=False)
+
         record = pd.DataFrame(
             [
                 {
@@ -1103,25 +1204,23 @@ class LineReviewerApp:
         if "excitation_potential" in row.index:
             record["excitation_potential"] = row["excitation_potential"]
 
-        mode = self.measurement_mode_var.get()
         ew_values = self.current_ew_values() if mode == "EW" else {}
         for key, value in ew_values.items():
             record[key] = value
 
-        if mode == "Fit Voigt" and self.fitted_voigt_line_key == (str(row["species"]), round(float(row["wavelength"]), 6)):
-            for index, spectrum in enumerate(self.spectra):
-                fitted = self.fitted_voigt_parameters.get(spectrum.label)
+        if mode == "Fit Voigt" and self.fitted_voigt_line_key == line_key:
+            for index in range(len(self.spectra)):
+                fitted = self.fitted_voigt_parameters.get(index)
                 if fitted is None:
                     continue
                 record[self._measurement_column("voigt_fit_depth", index)] = fitted[0]
                 record[self._measurement_column("voigt_fit_sigma", index)] = fitted[1]
                 record[self._measurement_column("voigt_fit_gamma", index)] = fitted[2]
                 record[self._measurement_column("voigt_fit_shift", index)] = fitted[3]
-                record[self._measurement_column("voigt_fit_area", index)] = (
-                    self.fitted_voigt_areas[spectrum.label] * ANGSTROM_TO_MILLIANGSTROM
-                )
+                area = self.fitted_voigt_areas[index]
+                record[self._measurement_column("voigt_fit_area", index)] = area * ANGSTROM_TO_MILLIANGSTROM
+                record[self._measurement_column("voigt_fit_log_reduced_ew", index)] = self._log_reduced_ew(area, center)
 
-        center = float(row["wavelength"])
         if mode == "EW":
             for index, column_name in enumerate(self.spectrum_flux_columns):
                 left, right = self._get_ew_bounds(column_name, center)
@@ -1207,9 +1306,6 @@ class LineReviewerApp:
             self._initialize_ew_bounds(center)
         self.refresh_plot()
 
-    def reset_ew_bounds(self) -> None:
-        self.reset_active_bounds()
-
     def _initialize_ew_bounds(self, center: float) -> None:
         self.integration_bounds = {
             column_name: (center - 3 * self.active_peak_window, center + 3 * self.active_peak_window)
@@ -1232,7 +1328,10 @@ class LineReviewerApp:
             )
             return
 
-        width = min(float(self.voigt_fit_width_var.get()), self.active_view_width)
+        try:
+            width = min(self.fit_half_width(), self.active_view_width)
+        except ValueError:
+            width = min(DEFAULT_VOIGT_FIT_WIDTH, self.active_view_width)
         self.fit_bounds[line_key] = self._clamp_bounds(center - width, center + width, center)
 
     def _get_fit_bounds(self, species: str, center: float) -> tuple[float, float]:
@@ -1288,7 +1387,7 @@ class LineReviewerApp:
         sample_wave = np.concatenate(([lo], segment_wave, [hi]))
         sample_flux = np.interp(sample_wave, wave, flux)
         integrand = 1.0 - sample_flux
-        return float(np.trapezoid(integrand, sample_wave))
+        return float(TRAPEZOID(integrand, sample_wave))
 
     def current_ew_values(self) -> dict[str, float]:
         row = self.current_line_row()
@@ -1373,16 +1472,26 @@ class LineReviewerApp:
         self.refresh_plot()
 
     def on_mouse_release(self, _event: Any) -> None:
+        released = self.dragging_handle
         self.dragging_handle = None
+        if released is not None and released[0] == "__fit__":
+            self.fit_voigt(show_warning=False)
+
+    def _log_reduced_ew(self, equivalent_width: float, wavelength: float) -> float:
+        if not np.isfinite(equivalent_width) or equivalent_width <= 0:
+            return float("nan")
+        return float(np.log10(equivalent_width / wavelength))
 
     def refresh_plot(self) -> None:
         self.ax.clear()
         row = self.current_line_row()
         if row is None:
-            self.ax.set_title("No yy lines match the current species and peak-flux filter")
-            self.ax.set_xlabel("Wavelength (A)")
-            self.ax.set_ylabel("Flux")
-            self.status_var.set("0 lines available")
+            self.ax.set_title("No yy lines match the current species and dip filter")
+            self.ax.set_xlabel("Wavelength (Å)")
+            self.ax.set_ylabel("Normalised flux")
+            self.position_var.set("Line 0 / 0")
+            self.kept_state_var.set("")
+            self.status_var.set("No lines available")
             self.canvas.draw_idle()
             return
 
@@ -1397,6 +1506,7 @@ class LineReviewerApp:
             if self.fitted_voigt_line_key != line_key:
                 self.fitted_voigt_parameters = {}
                 self.fitted_voigt_areas = {}
+                self.fitted_voigt_bounds = None
 
         view_width = self.active_view_width
         peak_window = self.active_peak_window
@@ -1440,7 +1550,7 @@ class LineReviewerApp:
             self.ax.axvline(fit_right, color="black", linewidth=1.1, linestyle="--", alpha=0.9)
             voigt_wave = np.linspace(wavelength - view_width, wavelength + view_width, 1200)
             for index, spectrum in enumerate(self.spectra):
-                fitted = self.fitted_voigt_parameters.get(spectrum.label)
+                fitted = self.fitted_voigt_parameters.get(index)
                 if fitted is None:
                     continue
                 fitted_flux = self._voigt_model(
@@ -1485,57 +1595,55 @@ class LineReviewerApp:
         lower = float(np.nanmin(combined_flux))
         upper = float(np.nanmax(combined_flux))
         padding = max((upper - lower) * 0.12, 0.03)
-        y_min = self.active_y_min if self.active_y_min is not None else self.active_peak_threshold + padding
+        y_min = self.active_y_min if self.active_y_min is not None else lower - padding
         y_max = self.active_y_max if self.active_y_max is not None else upper + padding
         if y_min >= y_max:
             y_min = min(lower - padding, y_max - 0.01)
 
+        kept = self.is_kept(row["species"], wavelength)
         self.ax.set_xlim(wavelength - view_width, wavelength + view_width)
         self.ax.set_ylim(y_min, y_max)
-        self.ax.set_xlabel("Wavelength (A)")
-        self.ax.set_ylabel("Flux")
-        self.ax.set_title(f"{row['species']} at {wavelength:.4f} A")
-        self.ax.legend(loc="upper right", fontsize=8)
+        self.ax.set_xlabel("Wavelength (Å)")
+        self.ax.set_ylabel("Normalised flux")
+        self.ax.set_title(
+            f"{row['species']} at {wavelength:.4f} Å" + ("  (kept)" if kept else ""),
+            color="forestgreen" if kept else "black",
+        )
+        self.ax.legend(loc="lower right", fontsize=8, framealpha=0.85)
         self.ax.grid(alpha=0.18)
 
-        kept_marker = "kept" if self.is_kept(row["species"], wavelength) else "not kept"
-        minima_text_parts: list[str] = []
-        for spectrum, column_name in zip(self.spectra, self.spectrum_flux_columns):
-            if column_name in row.index:
-                minima_text_parts.append(f"{spectrum.label}={row[column_name]:.3f}")
-        minima_text = "  ".join(minima_text_parts)
+        self.position_var.set(f"Line {self.current_index + 1} / {len(self.filtered_lines)}")
+        self.kept_state_var.set("KEPT" if kept else "not kept")
+        self.kept_state_label.configure(foreground="forestgreen" if kept else "gray40")
 
-        ew_values = self.current_ew_values() if mode == "EW" else {}
-        self.last_ew_values = ew_values
-        ew_text_parts: list[str] = []
-        for index, (spectrum, column_name) in enumerate(zip(self.spectra, self.spectrum_flux_columns)):
-            ew_value = ew_values.get(self._measurement_column("ew", index), float("nan"))
-            ew_text_parts.append(f"{spectrum.label}={ew_value:.3f}mA")
-        ew_text = "  ".join(ew_text_parts)
-        ew_mean = ew_values.get("ew_mean", float("nan"))
-        voigt_area_milliangstrom = self.last_voigt_area * ANGSTROM_TO_MILLIANGSTROM
-        voigt_text = f"  Voigt area={voigt_area_milliangstrom:.3f}mA" if mode == "Manual Voigt" else ""
-        fitted_text = (
-            "  Fit area" + ", ".join(
-                (f": {label}=" if len(self.spectra) > 1 else "=") 
-                + f"{area * ANGSTROM_TO_MILLIANGSTROM:.3f}mA"
-                + f" log(EW/lambda)={np.log10(area / wavelength)}"
-                for label, area in self.fitted_voigt_areas.items()
-            )
-            if mode == "Fit Voigt"
-            else ""
-        )
+        dip_parts = [f"dip={row['min_flux']:.3f}"]
+        if len(self.spectra) > 1:
+            for spectrum, column_name in zip(self.spectra, self.spectrum_flux_columns):
+                if column_name in row.index:
+                    dip_parts.append(f"{spectrum.label}={row[column_name]:.3f}")
 
-        measurement_text = ""
         if mode == "EW":
-            measurement_text = f"EW: {ew_text}  mean={ew_mean:.3f}mA"
+            ew_values = self.current_ew_values()
+            ew_parts = [
+                f"{spectrum.label}={ew_values.get(self._measurement_column('ew', index), float('nan')):.1f} mÅ"
+                for index, spectrum in enumerate(self.spectra)
+            ]
+            if len(self.spectra) > 1:
+                ew_parts.append(f"mean={ew_values.get('ew_mean', float('nan')):.1f} mÅ")
+            measurement_text = "EW: " + "  ".join(ew_parts)
         elif mode == "Manual Voigt":
-            measurement_text = voigt_text.strip()
+            measurement_text = f"Voigt area={self.last_voigt_area * ANGSTROM_TO_MILLIANGSTROM:.1f} mÅ"
         else:
-            measurement_text = fitted_text.strip() or "Fit area=not fitted"
-        self.status_var.set(
-            f"{self.current_index + 1}/{len(self.filtered_lines)}  |  {minima_text if len(self.spectra) > 1 else ""}  dip={row['min_flux']:.3f}  |  {measurement_text}  |  {kept_marker}  |  saved={len(self.kept_lines)}"
-        )
+            fit_parts = []
+            for index, area in self.fitted_voigt_areas.items():
+                prefix = f"{self.spectra[index].label}: " if len(self.spectra) > 1 else ""
+                fit_parts.append(
+                    f"{prefix}{area * ANGSTROM_TO_MILLIANGSTROM:.1f} mÅ, "
+                    f"log(W/λ)={self._log_reduced_ew(area, wavelength):.3f}"
+                )
+            measurement_text = "Fit area: " + ("  |  ".join(fit_parts) if fit_parts else "not fitted")
+
+        self.status_var.set(f"{'  '.join(dip_parts)}    {measurement_text}    saved={len(self.kept_lines)}")
 
         if mode == "EW":
             self.ax.axvspan(wavelength - peak_window, wavelength + peak_window, color="forestgreen", alpha=0.06)
@@ -1572,7 +1680,7 @@ class LineReviewerApp:
 
 def main() -> None:
     root = tk.Tk()
-    app = LineReviewerApp(root)
+    LineReviewerApp(root)
     root.minsize(1150, 600)
     root.mainloop()
 

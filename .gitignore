@@ -1,2 +1,4 @@
 lines_complete_4000_YY.csv
-__pycache__/review_yy_lines.cpython-312.pyc
+__pycache__/
+# Local configuration holds machine-specific paths; see review_yy_lines_config.example.json.
+review_yy_lines_config.json

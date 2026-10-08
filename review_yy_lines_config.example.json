@@ -1,0 +1,21 @@
+{
+  "yy_lines": "/path/to/geslines.dat",
+  "non_yy_lines": "/path/to/geslines.dat",
+  "output": "/path/to/kept_lines.csv",
+  "spectra": [
+    {"label": "HD2454", "path": "/path/to/2454_all_normalised.coadd.csv"}
+  ],
+  "peak_threshold": "0.0",
+  "peak_window": "0.05",
+  "view_width": "1.0",
+  "y_min": "-0.05",
+  "y_max": "1.1",
+  "show_other_yy": true,
+  "show_non_yy": true,
+  "measurement_mode": "Fit Voigt",
+  "voigt_depth": 0.5,
+  "voigt_sigma": 0.05,
+  "voigt_gamma": 0.05,
+  "voigt_shift": 0.0,
+  "voigt_fit_width": 0.2
+}
