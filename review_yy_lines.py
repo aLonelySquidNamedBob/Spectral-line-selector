@@ -36,6 +36,8 @@ DEFAULT_VOIGT_FIT_WIDTH = 0.2
 ANGSTROM_TO_MILLIANGSTROM = 1000.0
 MEASUREMENT_MODES = ["EW", "Manual Voigt", "Fit Voigt"]
 DEFAULT_MEASUREMENT_MODE = "Fit Voigt"
+# Left, right, bottom, top; wide enough for tick labels, the axis labels and the title.
+PLOT_MARGINS_INCHES = (0.8, 0.5, 0.65, 0.45)
 TEXT_INPUT_CLASSES = {"Entry", "TEntry", "Spinbox", "TSpinbox", "TCombobox"}
 # np.trapezoid only exists from NumPy 2.0; np.trapz is the same rule on older versions.
 TRAPEZOID = getattr(np, "trapezoid", None) or np.trapz
@@ -824,15 +826,19 @@ class LineReviewerApp:
             self.root, textvariable=self.status_var, style="Status.TLabel", relief=tk.SUNKEN, anchor="w"
         ).pack(side=tk.BOTTOM, fill=tk.X)
 
-        figure = Figure(figsize=(13, 7), dpi=100, layout="tight")
-        self.ax = figure.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(figure, master=self.root)
+        # Fixed margins instead of a tight layout: a tight layout re-fits the axes to the title
+        # and tick labels on every draw, so the plot jumped when they changed.
+        self.figure = Figure(figsize=(13, 7), dpi=100)
+        self.ax = self.figure.add_subplot(111)
+        self._apply_plot_margins()
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.root)
         # Pack the toolbar before the canvas so it is not squeezed out when the window shrinks.
         toolbar = NavigationToolbar2Tk(self.canvas, self.root, pack_toolbar=False)
         toolbar.update()
         toolbar.pack(side=tk.BOTTOM, fill=tk.X)
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+        self.canvas.mpl_connect("resize_event", self._apply_plot_margins)
         self.canvas.mpl_connect("button_press_event", self.on_mouse_press)
         self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
         self.canvas.mpl_connect("button_release_event", self.on_mouse_release)
@@ -844,6 +850,19 @@ class LineReviewerApp:
         self.root.bind("<Delete>", self._shortcut(self.remove_current_line))
         self.root.bind("<Return>", self._shortcut(self.keep_current_line, in_text_field=self.apply_filters))
         self.root.bind("<KP_Enter>", self._shortcut(self.keep_current_line, in_text_field=self.apply_filters))
+
+    def _apply_plot_margins(self, _event: Any = None) -> None:
+        # Margins are fixed in inches so the axes keep their place when the window is resized.
+        width, height = self.figure.get_size_inches()
+        if width <= 0 or height <= 0:
+            return
+        left, right, bottom, top = PLOT_MARGINS_INCHES
+        self.figure.subplots_adjust(
+            left=min(left / width, 0.3),
+            right=1.0 - min(right / width, 0.3),
+            bottom=min(bottom / height, 0.3),
+            top=1.0 - min(top / height, 0.3),
+        )
 
     def _shortcut(self, action: Any, in_text_field: Any = None) -> Any:
         def handler(event: Any) -> None:
