@@ -36,9 +36,30 @@ back. Everything in it can also be set in the GUI under *Show input configuratio
 - **EW**: trapezoidal integral of $1 - F$ between two draggable bounds per spectrum.
 - **Manual Voigt**: a Voigt profile set with the sliders; its area is reported.
 - **Fit Voigt**: least-squares Voigt fit inside a draggable fit region (refits when the region
-  is released). The area is the analytic integral of the profile.
+  is released).
 
-Areas are reported in mÅ; the fitted mode also gives $\log_{10}(W/\lambda)$.
+In both Voigt modes the equivalent width $W$ is the profile integrated over the fitted centre
+$\pm 2\,\mathrm{FWHM}$, with the Voigt FWHM from Olivero & Longbothum (1977). The full
+(infinite-wing) area is still reported and saved for comparison; it is larger whenever the
+profile has Lorentzian wings (a pure Lorentzian keeps only 84 % of its area within $\pm 2\,\mathrm{FWHM}$,
+a pure Gaussian all of it). Widths are in mÅ; the fitted mode also gives $\log_{10}(W/\lambda)$
+and the local RV, $c\,\Delta\lambda/\lambda$.
+
+### Per-line review
+
+- **Continuum**: a manual continuum level per line (0.9–1.1, default 1). The spectrum is divided
+  by it before fitting and EW integration; the level is drawn as a dashed line. No continuum is
+  fitted automatically.
+- **Blended**: a manual flag, saved with the line.
+- **Comment**: free text, saved with the line. Enter in this field keeps the line.
+- **Warnings** (Fit Voigt) appear under these controls:
+  - the local RV exceeds the *RV warning* threshold (km/s, in the Measurement panel);
+  - *possible blend*: the fit residuals within $\pm 2\,\mathrm{FWHM}$ differ between the blue
+    and red side by more than 3 mÅ. This is a hint only: on HD 2454 Fe 1 it caught 14 of 19
+    lines noted as blended, with 24 false alarms among 110 others.
+
+The panel above the plot shows how many lines are kept per species. Continuum, blend flag
+and comment are restored from the output CSV when you revisit a kept line.
 
 ### Shortcuts
 
@@ -47,5 +68,6 @@ Areas are reported in mÅ; the fitted mode also gives $\log_{10}(W/\lambda)$.
 | Left / Right | previous / next line |
 | Enter | keep the current line (in a text field: apply the settings) |
 | Delete | remove the current line from the output |
+| B | toggle the blended flag |
 
 Kept lines are written to the output CSV immediately.

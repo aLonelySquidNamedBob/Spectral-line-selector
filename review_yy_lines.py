@@ -39,6 +39,14 @@ DEFAULT_MEASUREMENT_MODE = "Fit Voigt"
 # Left, right, bottom, top; wide enough for tick labels, the axis labels and the title.
 PLOT_MARGINS_INCHES = (0.8, 0.5, 0.65, 0.45)
 TEXT_INPUT_CLASSES = {"Entry", "TEntry", "Spinbox", "TSpinbox", "TCombobox"}
+SPEED_OF_LIGHT_KMS = 299792.458
+# Equivalent widths of the Voigt modes are integrated over centre ± this many FWHM.
+EW_INTEGRATION_FWHM = 2.0
+DEFAULT_RV_WARNING_KMS = 1.0
+# A blue/red imbalance of the fit residuals within ±2 FWHM above this (mÅ) suggests a blend.
+# On HD 2454 Fe 1 this caught 14 of 19 lines noted as blended, with 24 of 110 false alarms.
+BLEND_ASYMMETRY_MILLIANGSTROM = 3.0
+CONTINUUM_SLIDER_RANGE = (0.9, 1.1)
 # np.trapezoid only exists from NumPy 2.0; np.trapz is the same rule on older versions.
 TRAPEZOID = getattr(np, "trapezoid", None) or np.trapz
 SPECTRUM_COLOR_CYCLE = [
@@ -57,6 +65,20 @@ GES_GFFLAG_INDEX = 83
 GES_SYNFLAG_INDEX = 85
 GES_LOW_ENERGY_SLICE = slice(185, 191)
 GES_UPPER_ENERGY_SLICE = slice(299, 305)
+
+def voigt_fwhm(sigma: float, gamma: float) -> float:
+    """Voigt FWHM from its Gaussian sigma and Lorentzian HWHM (Olivero & Longbothum 1977, ~0.02 %)."""
+    gaussian_fwhm = 2.0 * np.sqrt(2.0 * np.log(2.0)) * sigma
+    lorentzian_fwhm = 2.0 * gamma
+    return float(0.5346 * lorentzian_fwhm + np.sqrt(0.2166 * lorentzian_fwhm**2 + gaussian_fwhm**2))
+
+
+def voigt_equivalent_width(depth: float, sigma: float, gamma: float, half_width: float) -> float:
+    """Area of depth * V(x) / V(0) between -half_width and +half_width, in the units of x."""
+    x = np.linspace(-half_width, half_width, 4001)
+    profile = voigt_profile(x, sigma, gamma) / voigt_profile(0.0, sigma, gamma)
+    return float(TRAPEZOID(depth * profile, x))
+
 
 # CLASSES
 
@@ -133,6 +155,13 @@ class LineReviewerApp:
         self.voigt_sigma_label_var = tk.StringVar()
         self.voigt_gamma_label_var = tk.StringVar()
         self.voigt_shift_label_var = tk.StringVar()
+        self.rv_warning_var = tk.StringVar(value=str(configuration.get("rv_warning_kms", DEFAULT_RV_WARNING_KMS)))
+        self.continuum_var = tk.DoubleVar(value=1.0)
+        self.continuum_label_var = tk.StringVar(value="1.0000")
+        self.blended_var = tk.BooleanVar(value=False)
+        self.comment_var = tk.StringVar(value="")
+        self.warning_var = tk.StringVar(value=" ")
+        self.counts_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="")
         self.position_var = tk.StringVar(value="")
         self.kept_state_var = tk.StringVar(value="")
@@ -160,6 +189,13 @@ class LineReviewerApp:
         self.fitted_voigt_areas: dict[int, float] = {}
         self.fitted_voigt_line_key: tuple[str, float] | None = None
         self.fitted_voigt_bounds: tuple[float, float] | None = None
+        self.fitted_voigt_continuum: float | None = None
+        self.fitted_residual_asymmetries: dict[int, float] = {}
+        # Per-line review state, keyed like the other line dictionaries; restored from the output CSV.
+        self.line_continuum: dict[tuple[str, float], float] = {}
+        self.line_blended: dict[tuple[str, float], bool] = {}
+        self.line_comment: dict[tuple[str, float], str] = {}
+        self.loading_line_state = False
         self.spectrum_cache: dict[Path, tuple[float, Spectrum]] = {}
 
         self._build_ui()
@@ -218,6 +254,7 @@ class LineReviewerApp:
             "voigt_gamma": self.voigt_gamma_var.get(),
             "voigt_shift": self.voigt_shift_var.get(),
             "voigt_fit_width": self.voigt_fit_width_var.get(),
+            "rv_warning_kms": self.rv_warning_var.get().strip(),
         }
 
     def save_configuration(self, path: Path | None = None) -> None:
@@ -268,6 +305,7 @@ class LineReviewerApp:
             (self.view_width_var, "view_width", DEFAULT_VIEW_WIDTH),
             (self.y_min_var, "y_min", DEFAULT_YMIN),
             (self.y_max_var, "y_max", DEFAULT_YMAX),
+            (self.rv_warning_var, "rv_warning_kms", DEFAULT_RV_WARNING_KMS),
         ]:
             variable.set(str(configuration.get(key, default)))
         self.show_other_yy_var.set(bool(configuration.get("show_other_yy", True)))
@@ -562,6 +600,16 @@ class LineReviewerApp:
             if not pd.isna(fit_left) and not pd.isna(fit_right):
                 saved_fit_bounds[line_key] = (float(fit_left), float(fit_right))
 
+            continuum = pd.to_numeric(row.get("continuum"), errors="coerce")
+            if not pd.isna(continuum):
+                self.line_continuum[line_key] = float(continuum)
+            blended = row.get("blended")
+            if not pd.isna(blended):
+                self.line_blended[line_key] = str(blended).strip().lower() in {"true", "1", "yes"}
+            comment = row.get("comment")
+            if not pd.isna(comment):
+                self.line_comment[line_key] = str(comment)
+
             bounds_for_line: dict[str, tuple[float, float]] = {}
 
             for index, column_name in enumerate(self.spectrum_flux_columns):
@@ -792,6 +840,10 @@ class LineReviewerApp:
 
         self.fit_controls = ttk.Frame(measurement_frame)
         self.fit_controls.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        rv_row = ttk.Frame(self.fit_controls)
+        rv_row.pack(side=tk.BOTTOM, anchor="w", pady=(4, 0))
+        ttk.Label(rv_row, text="RV warning (km/s)").pack(side=tk.LEFT)
+        ttk.Entry(rv_row, textvariable=self.rv_warning_var, width=5).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(self.fit_controls, text="Initial fit half-width (Å)").pack(side=tk.LEFT)
         ttk.Spinbox(
             self.fit_controls,
@@ -804,8 +856,39 @@ class LineReviewerApp:
         ttk.Button(self.fit_controls, text="Refit", command=self.fit_voigt).pack(side=tk.LEFT)
         self._update_voigt_labels()
 
+        line_frame = ttk.LabelFrame(self.controls_frame, text="Current line", padding=(8, 4))
+        line_frame.grid(row=0, column=3, sticky="nsew", padx=(0, 8))
+        self.controls_frame.grid_columnconfigure(3, weight=1)
+        ttk.Label(line_frame, text="Continuum").grid(row=0, column=0, sticky="w")
+        continuum_row = ttk.Frame(line_frame)
+        continuum_row.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self.continuum_scale = ttk.Scale(
+            continuum_row,
+            from_=CONTINUUM_SLIDER_RANGE[0],
+            to=CONTINUUM_SLIDER_RANGE[1],
+            variable=self.continuum_var,
+            orient=tk.HORIZONTAL,
+            length=130,
+            command=lambda _value: self._continuum_changed(),
+        )
+        self.continuum_scale.pack(side=tk.LEFT)
+        self.continuum_scale.bind("<ButtonRelease-1>", lambda _event: self._fit_current_line_if_needed())
+        ttk.Label(continuum_row, textvariable=self.continuum_label_var, width=7).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(continuum_row, text="Reset", width=6, command=self.reset_continuum).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(
+            line_frame, text="Blended [B]", variable=self.blended_var, command=self._blended_changed
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(line_frame, text="Comment").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        comment_entry = ttk.Entry(line_frame, textvariable=self.comment_var, width=24)
+        comment_entry.grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=(4, 0))
+        # Enter in the comment field keeps the line (with its comment) instead of applying settings.
+        comment_entry.bind("<Return>", lambda _event: (self.keep_current_line(), "break")[1])
+        comment_entry.bind("<KP_Enter>", lambda _event: (self.keep_current_line(), "break")[1])
+        line_frame.grid_columnconfigure(1, weight=1)
+        self.comment_var.trace_add("write", lambda *_args: self._comment_changed())
+
         ttk.Button(self.controls_frame, text="Apply", command=self.apply_filters).grid(
-            row=0, column=3, sticky="s", pady=(0, 4)
+            row=0, column=4, sticky="s", pady=(0, 4)
         )
 
         nav = ttk.Frame(self.root, padding=(10, 2, 10, 6))
@@ -820,6 +903,11 @@ class LineReviewerApp:
         self.kept_state_label = ttk.Label(nav, textvariable=self.kept_state_var, style="Position.TLabel")
         self.kept_state_label.pack(side=tk.RIGHT)
         ttk.Label(nav, textvariable=self.position_var, style="Position.TLabel").pack(side=tk.RIGHT, padx=(0, 16))
+        ttk.Label(nav, textvariable=self.counts_var).pack(side=tk.RIGHT, padx=(0, 16))
+        # Warnings share the navigation row, so they never take vertical space from the plot.
+        ttk.Label(nav, textvariable=self.warning_var, foreground="firebrick", style="Position.TLabel").pack(
+            side=tk.LEFT, padx=(16, 0)
+        )
         self._update_mode_controls()
 
         ttk.Label(
@@ -848,6 +936,7 @@ class LineReviewerApp:
         self.root.bind("<Left>", self._shortcut(self.previous_line))
         self.root.bind("<Right>", self._shortcut(self.next_line))
         self.root.bind("<Delete>", self._shortcut(self.remove_current_line))
+        self.root.bind("<b>", self._shortcut(self.toggle_blended))
         self.root.bind("<Return>", self._shortcut(self.keep_current_line, in_text_field=self.apply_filters))
         self.root.bind("<KP_Enter>", self._shortcut(self.keep_current_line, in_text_field=self.apply_filters))
 
@@ -967,6 +1056,11 @@ class LineReviewerApp:
         area = depth / peak
         return 1.0 - depth * normalized_profile, area
 
+    def manual_equivalent_width(self) -> float:
+        """Equivalent width (Å) of the manual profile within centre ± EW_INTEGRATION_FWHM * FWHM."""
+        depth, sigma, gamma = self.voigt_parameters()
+        return voigt_equivalent_width(depth, sigma, gamma, EW_INTEGRATION_FWHM * voigt_fwhm(sigma, gamma))
+
     def _voigt_model(
         self,
         wavelength: np.ndarray,
@@ -994,10 +1088,12 @@ class LineReviewerApp:
 
         center = float(row["wavelength"])
         line_key = (str(row["species"]), round(center, 6))
+        continuum = self.line_continuum.get(line_key, 1.0)
         fit_left, fit_right = self._get_fit_bounds(str(row["species"]), center)
         fit_width = max(center - fit_left, fit_right - center)
         fitted_parameters: dict[int, tuple[float, float, float, float]] = {}
         fitted_areas: dict[int, float] = {}
+        residual_asymmetries: dict[int, float] = {}
         failures: list[str] = []
         initial = [
             depth,
@@ -1011,7 +1107,8 @@ class LineReviewerApp:
         for index, spectrum in enumerate(self.spectra):
             left_index, right_index = spectrum.bounds(center, fit_width)
             wave = spectrum.wavelength[left_index:right_index]
-            flux = spectrum.flux[left_index:right_index]
+            # The manual continuum level renormalises the local spectrum before fitting.
+            flux = spectrum.flux[left_index:right_index] / continuum
             region_mask = (wave >= fit_left) & (wave <= fit_right)
             wave = wave[region_mask]
             flux = flux[region_mask]
@@ -1040,16 +1137,127 @@ class LineReviewerApp:
             fitted_parameters[index] = (fit_depth, fit_sigma, fit_gamma, fit_shift)
             fitted_areas[index] = fit_depth / float(voigt_profile(0.0, fit_sigma, fit_gamma))
 
+            residual_asymmetries[index] = self._residual_asymmetry(
+                spectrum, center, continuum, fit_depth, fit_sigma, fit_gamma, fit_shift
+            )
+
         self.fitted_voigt_parameters = fitted_parameters
         self.fitted_voigt_areas = fitted_areas
+        self.fitted_residual_asymmetries = residual_asymmetries
         self.fitted_voigt_line_key = line_key
         self.fitted_voigt_bounds = (fit_left, fit_right)
+        self.fitted_voigt_continuum = continuum
         if self.measurement_mode_var.get() != "Fit Voigt":
             self.measurement_mode_var.set("Fit Voigt")
             self._update_mode_controls()
         self.refresh_plot()
         if failures and show_warning:
             messagebox.showwarning("Voigt fit incomplete", f"No fit was found for: {', '.join(failures)}")
+
+    def _residual_asymmetry(
+        self,
+        spectrum: Spectrum,
+        center: float,
+        continuum: float,
+        depth: float,
+        sigma: float,
+        gamma: float,
+        shift: float,
+    ) -> float:
+        """|∫ blue residuals − ∫ red residuals| (Å) within ±EW_INTEGRATION_FWHM * FWHM of the fitted centre.
+
+        A single unblended line leaves symmetric residuals; a neighbour in one wing does not.
+        """
+        line_center = center + shift
+        wave, flux = spectrum.region(line_center, EW_INTEGRATION_FWHM * voigt_fwhm(sigma, gamma))
+        valid = np.isfinite(wave) & np.isfinite(flux)
+        wave, flux = wave[valid], flux[valid]
+        residuals = flux / continuum - self._voigt_model(wave, center, depth, sigma, gamma, shift)
+        blue, red = wave <= line_center, wave >= line_center
+        if np.count_nonzero(blue) < 2 or np.count_nonzero(red) < 2:
+            return float("nan")
+        return float(abs(TRAPEZOID(residuals[blue], wave[blue]) - TRAPEZOID(residuals[red], wave[red])))
+
+    def fitted_equivalent_width(self, index: int) -> float:
+        """Equivalent width (Å) of a fitted profile within centre ± EW_INTEGRATION_FWHM * FWHM."""
+        depth, sigma, gamma, _shift = self.fitted_voigt_parameters[index]
+        return voigt_equivalent_width(depth, sigma, gamma, EW_INTEGRATION_FWHM * voigt_fwhm(sigma, gamma))
+
+    def fitted_rv(self, index: int, wavelength: float) -> float:
+        return SPEED_OF_LIGHT_KMS * self.fitted_voigt_parameters[index][3] / wavelength
+
+    def rv_warning_threshold(self) -> float | None:
+        try:
+            threshold = float(self.rv_warning_var.get())
+        except ValueError:
+            return None
+        return threshold if threshold > 0 else None
+
+    def current_line_key(self) -> tuple[str, float] | None:
+        row = self.current_line_row()
+        if row is None:
+            return None
+        return (str(row["species"]), round(float(row["wavelength"]), 6))
+
+    def current_continuum(self) -> float:
+        key = self.current_line_key()
+        return 1.0 if key is None else self.line_continuum.get(key, 1.0)
+
+    def _load_line_state(self, line_key: tuple[str, float]) -> None:
+        self.loading_line_state = True
+        try:
+            continuum = self.line_continuum.get(line_key, 1.0)
+            self.continuum_var.set(continuum)
+            self.continuum_label_var.set(f"{continuum:.4f}")
+            self.blended_var.set(self.line_blended.get(line_key, False))
+            self.comment_var.set(self.line_comment.get(line_key, ""))
+        finally:
+            self.loading_line_state = False
+
+    def _continuum_changed(self) -> None:
+        key = self.current_line_key()
+        if key is None or self.loading_line_state:
+            return
+        continuum = round(float(self.continuum_var.get()), 4)
+        self.line_continuum[key] = continuum
+        self.continuum_label_var.set(f"{continuum:.4f}")
+        self.refresh_plot()
+
+    def reset_continuum(self) -> None:
+        key = self.current_line_key()
+        if key is None:
+            return
+        self.line_continuum.pop(key, None)
+        self._load_line_state(key)
+        self._fit_current_line_if_needed()
+        self.refresh_plot()
+
+    def _blended_changed(self) -> None:
+        key = self.current_line_key()
+        if key is not None and not self.loading_line_state:
+            self.line_blended[key] = bool(self.blended_var.get())
+
+    def toggle_blended(self) -> None:
+        if self.current_line_key() is None:
+            return
+        self.blended_var.set(not self.blended_var.get())
+        self._blended_changed()
+
+    def _comment_changed(self) -> None:
+        key = self.current_line_key()
+        if key is not None and not self.loading_line_state:
+            self.line_comment[key] = self.comment_var.get()
+
+    def kept_counts_text(self) -> str:
+        current = self.current_species.get()
+        counts: dict[str, int] = {}
+        if not self.kept_lines.empty and "species" in self.kept_lines.columns:
+            counts = self.kept_lines["species"].astype(str).value_counts().to_dict()
+        if current:
+            counts.setdefault(current, 0)
+        if not counts:
+            return ""
+        return "Kept: " + "   ".join(f"{species} {counts[species]}" for species in sorted(counts))
 
     def min_flux_values(self, wavelength: float, half_window: float) -> dict[str, float]:
         key = (round(float(wavelength), 6), round(float(half_window), 6))
@@ -1180,9 +1388,10 @@ class LineReviewerApp:
         if mode == "Fit Voigt" and (
             self.fitted_voigt_line_key != line_key
             or self.fitted_voigt_bounds != self._get_fit_bounds(line_key[0], center)
+            or self.fitted_voigt_continuum != self.line_continuum.get(line_key, 1.0)
         ):
-            # The fit is stale (bounds were dragged or no fit yet): refit so the saved
-            # parameters always belong to the saved fit region.
+            # The fit is stale (bounds or continuum changed, or no fit yet): refit so the saved
+            # parameters always belong to the saved fit region and continuum.
             self.fit_voigt(show_warning=False)
 
         record = pd.DataFrame(
@@ -1193,6 +1402,9 @@ class LineReviewerApp:
                     "min_flux": row["min_flux"],
                     "source": Path(self.yy_lines_path_var.get()).name,
                     "measurement_mode": self.measurement_mode_var.get(),
+                    "continuum": self.line_continuum.get(line_key, 1.0),
+                    "blended": self.line_blended.get(line_key, False),
+                    "comment": self.line_comment.get(line_key, ""),
                 }
             ]
         )
@@ -1218,8 +1430,19 @@ class LineReviewerApp:
                 record[self._measurement_column("voigt_fit_gamma", index)] = fitted[2]
                 record[self._measurement_column("voigt_fit_shift", index)] = fitted[3]
                 area = self.fitted_voigt_areas[index]
+                equivalent_width = self.fitted_equivalent_width(index)
                 record[self._measurement_column("voigt_fit_area", index)] = area * ANGSTROM_TO_MILLIANGSTROM
-                record[self._measurement_column("voigt_fit_log_reduced_ew", index)] = self._log_reduced_ew(area, center)
+                record[self._measurement_column("voigt_fit_fwhm", index)] = voigt_fwhm(fitted[1], fitted[2])
+                record[self._measurement_column("voigt_fit_ew_2fwhm", index)] = (
+                    equivalent_width * ANGSTROM_TO_MILLIANGSTROM
+                )
+                record[self._measurement_column("voigt_fit_log_reduced_ew", index)] = self._log_reduced_ew(
+                    equivalent_width, center
+                )
+                record[self._measurement_column("voigt_fit_rv_kms", index)] = self.fitted_rv(index, center)
+                record[self._measurement_column("voigt_fit_residual_asymmetry", index)] = (
+                    self.fitted_residual_asymmetries.get(index, float("nan")) * ANGSTROM_TO_MILLIANGSTROM
+                )
 
         if mode == "EW":
             for index, column_name in enumerate(self.spectrum_flux_columns):
@@ -1233,6 +1456,7 @@ class LineReviewerApp:
         elif mode == "Manual Voigt":
             _, manual_area = self.voigt_values(center, np.array([center]))
             record["voigt_manual_area"] = manual_area * ANGSTROM_TO_MILLIANGSTROM
+            record["voigt_manual_ew_2fwhm"] = self.manual_equivalent_width() * ANGSTROM_TO_MILLIANGSTROM
             record["voigt_manual_shift"] = float(self.voigt_shift_var.get())
 
         if self.kept_lines.empty:
@@ -1368,7 +1592,9 @@ class LineReviewerApp:
         self.integration_bounds[column_name] = (left, right)
         return left, right
 
-    def _integrate_equivalent_width(self, spectrum: Spectrum, left: float, right: float) -> float:
+    def _integrate_equivalent_width(
+        self, spectrum: Spectrum, left: float, right: float, continuum: float = 1.0
+    ) -> float:
         if left >= right:
             return float("nan")
 
@@ -1386,7 +1612,7 @@ class LineReviewerApp:
         segment_wave = wave[mask]
         sample_wave = np.concatenate(([lo], segment_wave, [hi]))
         sample_flux = np.interp(sample_wave, wave, flux)
-        integrand = 1.0 - sample_flux
+        integrand = 1.0 - sample_flux / continuum
         return float(TRAPEZOID(integrand, sample_wave))
 
     def current_ew_values(self) -> dict[str, float]:
@@ -1400,7 +1626,7 @@ class LineReviewerApp:
 
         for index, (spectrum, column_name) in enumerate(zip(self.spectra, self.spectrum_flux_columns)):
             left, right = self._get_ew_bounds(column_name, center)
-            ew = self._integrate_equivalent_width(spectrum, left, right)
+            ew = self._integrate_equivalent_width(spectrum, left, right, self.current_continuum())
             ew_values[self._measurement_column("ew", index)] = ew * ANGSTROM_TO_MILLIANGSTROM
 
             if not np.isnan(ew):
@@ -1491,6 +1717,8 @@ class LineReviewerApp:
             self.ax.set_ylabel("Normalised flux")
             self.position_var.set("Line 0 / 0")
             self.kept_state_var.set("")
+            self.counts_var.set(self.kept_counts_text())
+            self.warning_var.set(" ")
             self.status_var.set("No lines available")
             self.canvas.draw_idle()
             return
@@ -1503,11 +1731,15 @@ class LineReviewerApp:
             if fit_key not in self.fit_bounds:
                 self._initialize_fit_bounds(str(row["species"]), wavelength)
             self.last_line_key = line_key
+            self._load_line_state(line_key)
             if self.fitted_voigt_line_key != line_key:
                 self.fitted_voigt_parameters = {}
                 self.fitted_voigt_areas = {}
+                self.fitted_residual_asymmetries = {}
                 self.fitted_voigt_bounds = None
+                self.fitted_voigt_continuum = None
 
+        continuum = self.line_continuum.get(line_key, 1.0)
         view_width = self.active_view_width
         peak_window = self.active_peak_window
 
@@ -1526,6 +1758,10 @@ class LineReviewerApp:
                 self.ax.axvline(left, color=color, linewidth=1.1, alpha=0.9)
                 self.ax.axvline(right, color=color, linewidth=1.1, linestyle="--", alpha=0.9)
 
+        self.ax.axhline(
+            continuum, color="gray", linestyle="--", linewidth=0.9, alpha=0.8, label=f"Continuum {continuum:.4f}"
+        )
+
         self.last_voigt_area = float("nan")
         mode = self.measurement_mode_var.get()
         if mode == "Manual Voigt":
@@ -1537,7 +1773,7 @@ class LineReviewerApp:
             if voigt_flux is not None:
                 self.ax.plot(
                     voigt_wave,
-                    voigt_flux,
+                    continuum * voigt_flux,
                     color="black",
                     linewidth=1.4,
                     linestyle="-.",
@@ -1561,14 +1797,21 @@ class LineReviewerApp:
                     fitted[2],
                     fitted[3],
                 )
+                color = SPECTRUM_COLOR_CYCLE[index % len(SPECTRUM_COLOR_CYCLE)]
                 self.ax.plot(
                     voigt_wave,
-                    fitted_flux,
-                    color=SPECTRUM_COLOR_CYCLE[index % len(SPECTRUM_COLOR_CYCLE)],
+                    continuum * fitted_flux,
+                    color=color,
                     linewidth=1.5,
                     linestyle="--",
                     label=f"Fitted Voigt: {spectrum.label}",
                 )
+                half_window = EW_INTEGRATION_FWHM * voigt_fwhm(fitted[1], fitted[2])
+                for edge, label in (
+                    (wavelength + fitted[3] - half_window, f"±{EW_INTEGRATION_FWHM:g} FWHM" if index == 0 else None),
+                    (wavelength + fitted[3] + half_window, None),
+                ):
+                    self.ax.axvline(edge, color=color, linestyle=":", linewidth=1.2, label=label)
         self.ax.axvline(wavelength, color="forestgreen", linewidth=1.8, label=f"Current yy line: {row['species']}")
 
         if self.show_other_yy_var.get():
@@ -1632,16 +1875,40 @@ class LineReviewerApp:
                 ew_parts.append(f"mean={ew_values.get('ew_mean', float('nan')):.1f} mÅ")
             measurement_text = "EW: " + "  ".join(ew_parts)
         elif mode == "Manual Voigt":
-            measurement_text = f"Voigt area={self.last_voigt_area * ANGSTROM_TO_MILLIANGSTROM:.1f} mÅ"
+            try:
+                manual_ew = self.manual_equivalent_width() * ANGSTROM_TO_MILLIANGSTROM
+            except ValueError:
+                manual_ew = float("nan")
+            measurement_text = (
+                f"W(±{EW_INTEGRATION_FWHM:g} FWHM)={manual_ew:.1f} mÅ"
+                f"  (full Voigt area {self.last_voigt_area * ANGSTROM_TO_MILLIANGSTROM:.1f} mÅ)"
+            )
         else:
             fit_parts = []
             for index, area in self.fitted_voigt_areas.items():
                 prefix = f"{self.spectra[index].label}: " if len(self.spectra) > 1 else ""
+                equivalent_width = self.fitted_equivalent_width(index)
                 fit_parts.append(
-                    f"{prefix}{area * ANGSTROM_TO_MILLIANGSTROM:.1f} mÅ, "
-                    f"log(W/λ)={self._log_reduced_ew(area, wavelength):.3f}"
+                    f"{prefix}W(±{EW_INTEGRATION_FWHM:g} FWHM)={equivalent_width * ANGSTROM_TO_MILLIANGSTROM:.1f} mÅ"
+                    f" (full {area * ANGSTROM_TO_MILLIANGSTROM:.1f}), "
+                    f"log(W/λ)={self._log_reduced_ew(equivalent_width, wavelength):.3f}, "
+                    f"RV={self.fitted_rv(index, wavelength):+.2f} km/s"
                 )
-            measurement_text = "Fit area: " + ("  |  ".join(fit_parts) if fit_parts else "not fitted")
+            measurement_text = "Fit: " + ("  |  ".join(fit_parts) if fit_parts else "not fitted")
+
+        warnings: list[str] = []
+        if mode == "Fit Voigt":
+            threshold = self.rv_warning_threshold()
+            for index in self.fitted_voigt_parameters:
+                prefix = f"{self.spectra[index].label}: " if len(self.spectra) > 1 else ""
+                rv = self.fitted_rv(index, wavelength)
+                if threshold is not None and abs(rv) > threshold:
+                    warnings.append(f"{prefix}RV {rv:+.2f} km/s")
+                asymmetry = self.fitted_residual_asymmetries.get(index, float("nan")) * ANGSTROM_TO_MILLIANGSTROM
+                if np.isfinite(asymmetry) and asymmetry > BLEND_ASYMMETRY_MILLIANGSTROM:
+                    warnings.append(f"{prefix}blend? asym. {asymmetry:.1f} mÅ")
+        self.warning_var.set("Warning: " + "  ".join(warnings) if warnings else " ")
+        self.counts_var.set(self.kept_counts_text())
 
         self.status_var.set(f"{'  '.join(dip_parts)}    {measurement_text}    saved={len(self.kept_lines)}")
 
