@@ -309,9 +309,9 @@ class LineReviewerApp:
         if not path.exists():
             raise ValueError(f"Spectrum file not found: {path}")
 
-        frame = pd.read_csv(path)
-        wavelength_col = self._find_column(frame.columns.tolist(), ["Wavelength", "wavelength"])
-        flux_col = self._find_column(frame.columns.tolist(), ["Flux", "flux"])
+        frame = pd.read_csv(path, sep=None, engine="python")
+        wavelength_col = self._find_column(frame.columns.tolist(), ["Wavelength", "wavelength", "wave"])
+        flux_col = self._find_column(frame.columns.tolist(), ["normed_flux", "Flux", "flux"])
 
         if wavelength_col is None or flux_col is None:
             raise ValueError(
@@ -359,7 +359,7 @@ class LineReviewerApp:
 
         frame = pd.read_csv(path)
         species_col = self._find_column(frame.columns.tolist(), ["species", "Species"])
-        wavelength_col = self._find_column(frame.columns.tolist(), ["wavelength", "Wavelength"])
+        wavelength_col = self._find_column(frame.columns.tolist(), ["wavelength", "wave"])
         if species_col is None or wavelength_col is None:
             raise ValueError(
                 f"{name} must contain species and wavelength columns."
@@ -370,7 +370,7 @@ class LineReviewerApp:
             "wavelength": pd.to_numeric(frame[wavelength_col], errors="coerce"),
         }
         for output_name, candidates in {
-            "ionisation_energy": ["ionisation_energy", "ionization_energy"],
+            "excitation_potential": ["excitation_potential", "excitation_energy"],
             "lower_energy": ["lower_energy", "low_energy"],
             "upper_energy": ["upper_energy"],
             "gfflag": ["gfflag", "gf_flag"],
@@ -433,7 +433,7 @@ class LineReviewerApp:
                     "synflag": synflag,
                     "lower_energy": lower_energy,
                     "upper_energy": upper_energy,
-                    "ionisation_energy": upper_energy,
+                    "excitation_potential": lower_energy,
                     "ges_line_number": line_number,
                 }
             )
@@ -448,7 +448,7 @@ class LineReviewerApp:
                 "synflag",
                 "lower_energy",
                 "upper_energy",
-                "ionisation_energy",
+                "excitation_potential",
                 "ges_line_number",
             ]
         )
@@ -1100,8 +1100,8 @@ class LineReviewerApp:
             if column_name in row.index:
                 record[self._measurement_column("min_flux", index)] = row[column_name]
 
-        if "ionisation_energy" in row.index:
-            record["ionisation_energy"] = row["ionisation_energy"]
+        if "excitation_potential" in row.index:
+            record["excitation_potential"] = row["excitation_potential"]
 
         mode = self.measurement_mode_var.get()
         ew_values = self.current_ew_values() if mode == "EW" else {}
@@ -1516,8 +1516,10 @@ class LineReviewerApp:
         voigt_area_milliangstrom = self.last_voigt_area * ANGSTROM_TO_MILLIANGSTROM
         voigt_text = f"  Voigt area={voigt_area_milliangstrom:.3f}mA" if mode == "Manual Voigt" else ""
         fitted_text = (
-            "  Fit area=" + ", ".join(
-                f"{label}={area * ANGSTROM_TO_MILLIANGSTROM:.3f}mA"
+            "  Fit area" + ", ".join(
+                (f": {label}=" if len(self.spectra) > 1 else "=") 
+                + f"{area * ANGSTROM_TO_MILLIANGSTROM:.3f}mA"
+                + f" log(EW/lambda)={np.log10(area / wavelength)}"
                 for label, area in self.fitted_voigt_areas.items()
             )
             if mode == "Fit Voigt"
@@ -1532,7 +1534,7 @@ class LineReviewerApp:
         else:
             measurement_text = fitted_text.strip() or "Fit area=not fitted"
         self.status_var.set(
-            f"{self.current_index + 1}/{len(self.filtered_lines)}  |  {minima_text}  dip={row['min_flux']:.3f}  |  {measurement_text}  |  {kept_marker}  |  saved={len(self.kept_lines)}"
+            f"{self.current_index + 1}/{len(self.filtered_lines)}  |  {minima_text if len(self.spectra) > 1 else ""}  dip={row['min_flux']:.3f}  |  {measurement_text}  |  {kept_marker}  |  saved={len(self.kept_lines)}"
         )
 
         if mode == "EW":
