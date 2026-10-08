@@ -840,6 +840,10 @@ class LineReviewerApp:
 
         self.fit_controls = ttk.Frame(measurement_frame)
         self.fit_controls.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        rv_row = ttk.Frame(self.fit_controls)
+        rv_row.pack(side=tk.BOTTOM, anchor="w", pady=(4, 0))
+        ttk.Label(rv_row, text="RV warning (km/s)").pack(side=tk.LEFT)
+        ttk.Entry(rv_row, textvariable=self.rv_warning_var, width=5).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(self.fit_controls, text="Initial fit half-width (Å)").pack(side=tk.LEFT)
         ttk.Spinbox(
             self.fit_controls,
@@ -850,12 +854,41 @@ class LineReviewerApp:
             width=6,
         ).pack(side=tk.LEFT, padx=(6, 8))
         ttk.Button(self.fit_controls, text="Refit", command=self.fit_voigt).pack(side=tk.LEFT)
-        ttk.Label(self.fit_controls, text="RV warning (km/s)").pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Entry(self.fit_controls, textvariable=self.rv_warning_var, width=5).pack(side=tk.LEFT, padx=(6, 0))
         self._update_voigt_labels()
 
+        line_frame = ttk.LabelFrame(self.controls_frame, text="Current line", padding=(8, 4))
+        line_frame.grid(row=0, column=3, sticky="nsew", padx=(0, 8))
+        self.controls_frame.grid_columnconfigure(3, weight=1)
+        ttk.Label(line_frame, text="Continuum").grid(row=0, column=0, sticky="w")
+        continuum_row = ttk.Frame(line_frame)
+        continuum_row.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self.continuum_scale = ttk.Scale(
+            continuum_row,
+            from_=CONTINUUM_SLIDER_RANGE[0],
+            to=CONTINUUM_SLIDER_RANGE[1],
+            variable=self.continuum_var,
+            orient=tk.HORIZONTAL,
+            length=130,
+            command=lambda _value: self._continuum_changed(),
+        )
+        self.continuum_scale.pack(side=tk.LEFT)
+        self.continuum_scale.bind("<ButtonRelease-1>", lambda _event: self._fit_current_line_if_needed())
+        ttk.Label(continuum_row, textvariable=self.continuum_label_var, width=7).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(continuum_row, text="Reset", width=6, command=self.reset_continuum).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(
+            line_frame, text="Blended [B]", variable=self.blended_var, command=self._blended_changed
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(line_frame, text="Comment").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        comment_entry = ttk.Entry(line_frame, textvariable=self.comment_var, width=24)
+        comment_entry.grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=(4, 0))
+        # Enter in the comment field keeps the line (with its comment) instead of applying settings.
+        comment_entry.bind("<Return>", lambda _event: (self.keep_current_line(), "break")[1])
+        comment_entry.bind("<KP_Enter>", lambda _event: (self.keep_current_line(), "break")[1])
+        line_frame.grid_columnconfigure(1, weight=1)
+        self.comment_var.trace_add("write", lambda *_args: self._comment_changed())
+
         ttk.Button(self.controls_frame, text="Apply", command=self.apply_filters).grid(
-            row=0, column=3, sticky="s", pady=(0, 4)
+            row=0, column=4, sticky="s", pady=(0, 4)
         )
 
         nav = ttk.Frame(self.root, padding=(10, 2, 10, 6))
@@ -871,37 +904,9 @@ class LineReviewerApp:
         self.kept_state_label.pack(side=tk.RIGHT)
         ttk.Label(nav, textvariable=self.position_var, style="Position.TLabel").pack(side=tk.RIGHT, padx=(0, 16))
         ttk.Label(nav, textvariable=self.counts_var).pack(side=tk.RIGHT, padx=(0, 16))
-
-        line_frame = ttk.LabelFrame(self.root, text="Current line", padding=(8, 2))
-        line_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 4))
-        ttk.Label(line_frame, text="Continuum").grid(row=0, column=0, sticky="w")
-        self.continuum_scale = ttk.Scale(
-            line_frame,
-            from_=CONTINUUM_SLIDER_RANGE[0],
-            to=CONTINUUM_SLIDER_RANGE[1],
-            variable=self.continuum_var,
-            orient=tk.HORIZONTAL,
-            length=180,
-            command=lambda _value: self._continuum_changed(),
-        )
-        self.continuum_scale.grid(row=0, column=1, padx=(6, 2))
-        self.continuum_scale.bind("<ButtonRelease-1>", lambda _event: self._fit_current_line_if_needed())
-        ttk.Label(line_frame, textvariable=self.continuum_label_var, width=7).grid(row=0, column=2, sticky="w")
-        ttk.Button(line_frame, text="Reset to 1", command=self.reset_continuum).grid(row=0, column=3, padx=(4, 16))
-        ttk.Checkbutton(
-            line_frame, text="Blended [B]", variable=self.blended_var, command=self._blended_changed
-        ).grid(row=0, column=4, padx=(0, 16))
-        ttk.Label(line_frame, text="Comment").grid(row=0, column=5, sticky="w")
-        comment_entry = ttk.Entry(line_frame, textvariable=self.comment_var)
-        comment_entry.grid(row=0, column=6, sticky="ew", padx=(6, 0))
-        # Enter in the comment field keeps the line (with its comment) instead of applying settings.
-        comment_entry.bind("<Return>", lambda _event: (self.keep_current_line(), "break")[1])
-        comment_entry.bind("<KP_Enter>", lambda _event: (self.keep_current_line(), "break")[1])
-        line_frame.grid_columnconfigure(6, weight=1)
-        self.comment_var.trace_add("write", lambda *_args: self._comment_changed())
-        # Always holds at least one character so its height, and hence the plot, never changes.
-        ttk.Label(line_frame, textvariable=self.warning_var, foreground="firebrick").grid(
-            row=1, column=0, columnspan=7, sticky="w", pady=(2, 0)
+        # Warnings share the navigation row, so they never take vertical space from the plot.
+        ttk.Label(nav, textvariable=self.warning_var, foreground="firebrick", style="Position.TLabel").pack(
+            side=tk.LEFT, padx=(16, 0)
         )
         self._update_mode_controls()
 
@@ -1898,11 +1903,11 @@ class LineReviewerApp:
                 prefix = f"{self.spectra[index].label}: " if len(self.spectra) > 1 else ""
                 rv = self.fitted_rv(index, wavelength)
                 if threshold is not None and abs(rv) > threshold:
-                    warnings.append(f"{prefix}local RV {rv:+.2f} km/s exceeds ±{threshold:g} km/s")
+                    warnings.append(f"{prefix}RV {rv:+.2f} km/s")
                 asymmetry = self.fitted_residual_asymmetries.get(index, float("nan")) * ANGSTROM_TO_MILLIANGSTROM
                 if np.isfinite(asymmetry) and asymmetry > BLEND_ASYMMETRY_MILLIANGSTROM:
-                    warnings.append(f"{prefix}possible blend: residuals asymmetric by {asymmetry:.1f} mÅ")
-        self.warning_var.set("WARNING: " + ";  ".join(warnings) if warnings else " ")
+                    warnings.append(f"{prefix}blend? asym. {asymmetry:.1f} mÅ")
+        self.warning_var.set("Warning: " + "  ".join(warnings) if warnings else " ")
         self.counts_var.set(self.kept_counts_text())
 
         self.status_var.set(f"{'  '.join(dip_parts)}    {measurement_text}    saved={len(self.kept_lines)}")
