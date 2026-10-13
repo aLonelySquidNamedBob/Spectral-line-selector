@@ -71,3 +71,9 @@ and comment are restored from the output CSV when you revisit a kept line.
 | B | toggle the blended flag |
 
 Kept lines are written to the output CSV immediately.
+
+## Tests
+
+`python -m pytest test_review_yy_lines.py` (needs `pytest`) checks the line-list parser, the
+EW and Voigt integrals, the residual-asymmetry blend hint and the CSV round trip, without
+opening a window.
