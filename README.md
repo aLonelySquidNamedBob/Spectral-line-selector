@@ -18,18 +18,24 @@ cp review_yy_lines_config.example.json review_yy_lines_config.json   # then edit
 python review_yy_lines.py
 ```
 
-The configuration file next to the script is loaded at start-up; **Save configuration** writes it
-back. Everything in it can also be set in the GUI under *Show input configuration*.
+The configuration file is not needed for startup.
+The desired configuration can be set under ```show input configuration```.
+Once this configuration achieved, it can be saved for later use, and reloaded.
 
 ### Inputs
+(originally, two separate line lists were required, both extracted from the Gaia-ESO line list. One of them complete, and the other filtered to only include the Y,Y quality flags.)
 
-- **YY line list**: a CSV with `species` and `wavelength` columns (optional `excitation_potential`,
-  `lower_energy`, `upper_energy`, `gfflag`, `synflag`), or a GES fixed-width `.dat` line list.
-  For a `.dat` file only lines with `gfflag = Y` and `synflag` in `{Y, U}` are used.
+- **YY line list**:
+  - a CSV with `species` and `wavelength` columns (optional `excitation_potential`,
+    `lower_energy`, `upper_energy`, `gfflag`, `synflag`), or
+  - a GES fixed-width `.dat` line list.
+    For a `.dat` file only lines with `gfflag = Y` and `synflag` in `{Y, U}` are used.
 - **Non-yy line list** (optional, drawn for reference only): same formats. Given a `.dat` file,
   it shows the complement of the YY selection, so the same file can be used for both.
 - **Spectra**: CSV/TSV/whitespace tables with a wavelength column (`wavelength` or `wave`) and a
   normalised flux column (`normed_flux` or `flux`). Wavelengths in Å, at rest.
+
+For download of the complete Gaia-ESO linelist, see [Heiter et. al. (2021)](https://doi.org/10.1051/0004-6361/201936291)
 
 ### Measurement modes
 
@@ -39,7 +45,7 @@ back. Everything in it can also be set in the GUI under *Show input configuratio
   is released).
 
 In both Voigt modes the equivalent width $W$ is the profile integrated over the fitted centre
-$\pm 2\,\mathrm{FWHM}$, with the Voigt FWHM from Olivero & Longbothum (1977). The full
+$\pm 2\,\mathrm{FWHM}$. The full
 (infinite-wing) area is still reported and saved for comparison; it is larger whenever the
 profile has Lorentzian wings (a pure Lorentzian keeps only 84 % of its area within $\pm 2\,\mathrm{FWHM}$,
 a pure Gaussian all of it). Widths are in mÅ; the fitted mode also gives $\log_{10}(W/\lambda)$
