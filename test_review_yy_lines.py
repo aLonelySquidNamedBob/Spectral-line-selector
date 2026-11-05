@@ -55,6 +55,30 @@ def test_ges_parser_reads_fixed_columns_and_splits_yy(tmp_path):
     assert other[["lower_energy", "upper_energy"]].values.tolist() == [[16.829, 19.438]]
 
 
+
+def test_ges_parser_uses_the_selected_flags(tmp_path):
+    path = tmp_path / "lines.dat"
+    path.write_text("\n".join(GES_RECORDS) + "\n", encoding="latin-1")
+    app = make_app()
+
+    # Default flags (gf Y, syn Y/U) give the same split as before.
+    assert app._load_ges_line_list(path, True)["species"].tolist() == ["Fe 1", "Fe 2"]
+    # Without U as a synflag both Fe lines drop out of the YY selection and into the complement.
+    yy = app._load_ges_line_list(path, True, gf_flags={"Y"}, syn_flags={"Y"})
+    assert yy.empty
+    other = app._load_ges_line_list(path, False, gf_flags={"Y"}, syn_flags={"Y"})
+    assert other["species"].tolist() == ["Cu 2", "Fe 1", "Fe 2"]
+    # "-" selects the unassessed records.
+    dashes = app._load_ges_line_list(path, True, gf_flags={"-"}, syn_flags={"-"})
+    assert dashes["species"].tolist() == ["Cu 2"]
+
+
+def test_configuration_flags_default_and_filter():
+    app = make_app()
+    assert app._configuration_flags({}, "gf_flags", r.DEFAULT_GF_FLAGS) == {"Y"}
+    assert app._configuration_flags({"gf_flags": []}, "gf_flags", r.DEFAULT_GF_FLAGS) == set()
+    assert app._configuration_flags({"syn_flags": ["y", "N", "x"]}, "syn_flags", r.DEFAULT_SYN_FLAGS) == {"Y", "N"}
+
 @pytest.mark.parametrize("separator", [",", ";", "\t", "   "])
 def test_read_table_detects_the_delimiter(tmp_path, separator):
     path = tmp_path / "spectrum.txt"

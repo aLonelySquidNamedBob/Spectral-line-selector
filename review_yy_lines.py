@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -63,6 +63,11 @@ GES_ION_SLICE = slice(0, 4)
 GES_WAVELENGTH_SLICE = slice(9, 18)
 GES_GFFLAG_INDEX = 83
 GES_SYNFLAG_INDEX = 85
+# Flag values offered as checkboxes ("-" = not assessed). A .dat line is in the YY selection when its
+# gfflag and its synflag are both among the checked values; the defaults reproduce gfflag Y, synflag Y/U.
+GES_FLAG_VALUES = ("Y", "U", "N", "-")
+DEFAULT_GF_FLAGS = ("Y",)
+DEFAULT_SYN_FLAGS = ("Y", "U")
 GES_LOW_ENERGY_SLICE = slice(185, 191)
 GES_UPPER_ENERGY_SLICE = slice(299, 305)
 
@@ -145,6 +150,10 @@ class LineReviewerApp:
         self.output_var = tk.StringVar(value=str(configuration.get("output", "")))
         self.show_other_yy_var = tk.BooleanVar(value=bool(configuration.get("show_other_yy", True)))
         self.show_non_yy_var = tk.BooleanVar(value=bool(configuration.get("show_non_yy", True)))
+        gf_flags = self._configuration_flags(configuration, "gf_flags", DEFAULT_GF_FLAGS)
+        syn_flags = self._configuration_flags(configuration, "syn_flags", DEFAULT_SYN_FLAGS)
+        self.gf_flag_vars = {flag: tk.BooleanVar(value=flag in gf_flags) for flag in GES_FLAG_VALUES}
+        self.syn_flag_vars = {flag: tk.BooleanVar(value=flag in syn_flags) for flag in GES_FLAG_VALUES}
         self.measurement_mode_var = tk.StringVar(value=self._configuration_mode(configuration))
         self.voigt_depth_var = tk.DoubleVar(value=self._configuration_float(configuration, "voigt_depth", DEFAULT_VOIGT_DEPTH))
         self.voigt_sigma_var = tk.DoubleVar(value=self._configuration_float(configuration, "voigt_sigma", DEFAULT_VOIGT_SIGMA))
@@ -216,6 +225,15 @@ class LineReviewerApp:
         mode = str(configuration.get("measurement_mode", DEFAULT_MEASUREMENT_MODE))
         return mode if mode in MEASUREMENT_MODES else DEFAULT_MEASUREMENT_MODE
 
+    def _configuration_flags(self, configuration: dict[str, Any], key: str, default: tuple[str, ...]) -> set[str]:
+        values = configuration.get(key)
+        if not isinstance(values, list):
+            return set(default)
+        return {str(value).strip().upper() for value in values} & set(GES_FLAG_VALUES)
+
+    def _selected_flags(self, variables: dict[str, tk.BooleanVar]) -> set[str]:
+        return {flag for flag, variable in variables.items() if variable.get()}
+
     def _configuration_float(self, configuration: dict[str, Any], key: str, default: float) -> float:
         try:
             return float(configuration.get(key, default))
@@ -244,6 +262,8 @@ class LineReviewerApp:
             "y_max": self.y_max_var.get().strip(),
             "show_other_yy": self.show_other_yy_var.get(),
             "show_non_yy": self.show_non_yy_var.get(),
+            "gf_flags": [flag for flag in GES_FLAG_VALUES if self.gf_flag_vars[flag].get()],
+            "syn_flags": [flag for flag in GES_FLAG_VALUES if self.syn_flag_vars[flag].get()],
             "spectra": [
                 {"label": row.label_var.get().strip(), "path": row.path_var.get().strip()}
                 for row in self.spectrum_rows
@@ -310,6 +330,13 @@ class LineReviewerApp:
             variable.set(str(configuration.get(key, default)))
         self.show_other_yy_var.set(bool(configuration.get("show_other_yy", True)))
         self.show_non_yy_var.set(bool(configuration.get("show_non_yy", True)))
+        for variables, key, default in [
+            (self.gf_flag_vars, "gf_flags", DEFAULT_GF_FLAGS),
+            (self.syn_flag_vars, "syn_flags", DEFAULT_SYN_FLAGS),
+        ]:
+            selected = self._configuration_flags(configuration, key, default)
+            for flag, variable in variables.items():
+                variable.set(flag in selected)
         self.measurement_mode_var.set(self._configuration_mode(configuration))
         self.voigt_depth_var.set(self._configuration_float(configuration, "voigt_depth", DEFAULT_VOIGT_DEPTH))
         self.voigt_sigma_var.set(self._configuration_float(configuration, "voigt_sigma", DEFAULT_VOIGT_SIGMA))
@@ -406,7 +433,15 @@ class LineReviewerApp:
         self.spectrum_cache[resolved] = (modified, spectrum)
         return spectrum
 
-    def _load_line_list(self, path_text: str, name: str, required: bool, yy_selection: bool) -> pd.DataFrame:
+    def _load_line_list(
+        self,
+        path_text: str,
+        name: str,
+        required: bool,
+        yy_selection: bool,
+        gf_flags: Iterable[str] = DEFAULT_GF_FLAGS,
+        syn_flags: Iterable[str] = DEFAULT_SYN_FLAGS,
+    ) -> pd.DataFrame:
         stripped = path_text.strip()
         if not stripped:
             if required:
@@ -421,9 +456,12 @@ class LineReviewerApp:
             return pd.DataFrame(columns=["species", "wavelength"])
 
         if path.suffix.lower() == ".dat":
-            loaded = self._load_ges_line_list(path, yy_selection)
+            loaded = self._load_ges_line_list(path, yy_selection, gf_flags, syn_flags)
             if required and loaded.empty:
-                raise ValueError(f"{name} has no valid matching lines after parsing.")
+                raise ValueError(
+                    f"{name} has no lines with the selected gf flags and synflags "
+                    f"(gf: {self._flag_text(gf_flags)}, syn: {self._flag_text(syn_flags)})."
+                )
             return loaded
 
         frame = pd.read_csv(path)
@@ -467,7 +505,19 @@ class LineReviewerApp:
             return float("nan")
         return float(match.group(0).replace("D", "E").replace("d", "e"))
 
-    def _load_ges_line_list(self, path: Path, yy_selection: bool) -> pd.DataFrame:
+    def _flag_text(self, flags: Iterable[str]) -> str:
+        selected = set(flags)
+        return ", ".join(flag for flag in GES_FLAG_VALUES if flag in selected) or "none"
+
+    def _load_ges_line_list(
+        self,
+        path: Path,
+        yy_selection: bool,
+        gf_flags: Iterable[str] = DEFAULT_GF_FLAGS,
+        syn_flags: Iterable[str] = DEFAULT_SYN_FLAGS,
+    ) -> pd.DataFrame:
+        gf_flags = set(gf_flags)
+        syn_flags = set(syn_flags)
         rows: list[dict[str, Any]] = []
         try:
             lines = path.read_text(encoding="latin-1").splitlines()
@@ -480,9 +530,9 @@ class LineReviewerApp:
 
             gfflag = line[GES_GFFLAG_INDEX].strip()
             synflag = line[GES_SYNFLAG_INDEX].strip()
-            # The YY list keeps the well-flagged lines; the reference list is its complement,
-            # so the same .dat file can be used for both without drawing YY lines twice.
-            is_yy = gfflag == "Y" and synflag in {"Y", "U"}
+            # The YY list keeps the lines whose flags are both checked; the reference list is its
+            # complement, so the same .dat file can be used for both without drawing YY lines twice.
+            is_yy = gfflag in gf_flags and synflag in syn_flags
             if is_yy != yy_selection:
                 continue
 
@@ -529,8 +579,19 @@ class LineReviewerApp:
         yy_path_text = self.yy_lines_path_var.get().strip()
         non_yy_path_text = self.non_yy_lines_path_var.get().strip()
 
-        yy_lines = self._load_line_list(yy_path_text, "YY line list", required=True, yy_selection=True)
-        non_yy_lines = self._load_line_list(non_yy_path_text, "Non-yy line list", required=False, yy_selection=False)
+        gf_flags = self._selected_flags(self.gf_flag_vars)
+        syn_flags = self._selected_flags(self.syn_flag_vars)
+        yy_lines = self._load_line_list(
+            yy_path_text, "YY line list", required=True, yy_selection=True, gf_flags=gf_flags, syn_flags=syn_flags
+        )
+        non_yy_lines = self._load_line_list(
+            non_yy_path_text,
+            "Non-yy line list",
+            required=False,
+            yy_selection=False,
+            gf_flags=gf_flags,
+            syn_flags=syn_flags,
+        )
 
         spectra: list[Spectrum] = []
         spectrum_flux_columns: list[str] = []
@@ -764,6 +825,20 @@ class LineReviewerApp:
             row=2, column=2, sticky="w", pady=(6, 0)
         )
         linelist_frame.grid_columnconfigure(1, weight=1)
+
+        flag_frame = ttk.Frame(self.config_frame)
+        flag_frame.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        ttk.Label(flag_frame, text="YY selection for GES .dat lists (both flags must be checked):").grid(
+            row=0, column=0, columnspan=len(GES_FLAG_VALUES) + 1, sticky="w"
+        )
+        for row_index, (label, variables) in enumerate(
+            [("gf flag", self.gf_flag_vars), ("synflag", self.syn_flag_vars)], start=1
+        ):
+            ttk.Label(flag_frame, text=label).grid(row=row_index, column=0, sticky="w", padx=(0, 8), pady=(2, 0))
+            for column, flag in enumerate(GES_FLAG_VALUES, start=1):
+                ttk.Checkbutton(flag_frame, text=flag, variable=variables[flag]).grid(
+                    row=row_index, column=column, sticky="w", padx=(0, 8), pady=(2, 0)
+                )
 
         spectrum_header = ttk.Frame(self.config_frame)
         spectrum_header.pack(side=tk.TOP, fill=tk.X, pady=(10, 2))

@@ -29,7 +29,9 @@ Once this configuration achieved, it can be saved for later use, and reloaded.
   - a CSV with `species` and `wavelength` columns (optional `excitation_potential`,
     `lower_energy`, `upper_energy`, `gfflag`, `synflag`), or
   - a GES fixed-width `.dat` line list.
-    For a `.dat` file only lines with `gfflag = Y` and `synflag` in `{Y, U}` are used.
+    For a `.dat` file only lines whose `gfflag` and `synflag` are both checked in the input
+    configuration are used (default: `gfflag = Y` and `synflag` in `{Y, U}`). Each flag can be
+    `Y`, `U`, `N` or `-` (not assessed). CSV line lists are not filtered by flag.
 - **Non-yy line list** (optional, drawn for reference only): same formats. Given a `.dat` file,
   it shows the complement of the YY selection, so the same file can be used for both.
 - **Spectra**: CSV/TSV/whitespace tables with a wavelength column (`wavelength` or `wave`) and a
