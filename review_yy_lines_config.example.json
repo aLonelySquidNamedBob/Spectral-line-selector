@@ -12,6 +12,8 @@
   "y_max": "1.1",
   "show_other_yy": true,
   "show_non_yy": true,
+  "gf_flags": ["Y"],
+  "syn_flags": ["Y", "U"],
   "measurement_mode": "Fit Voigt",
   "voigt_depth": 0.5,
   "voigt_sigma": 0.05,
